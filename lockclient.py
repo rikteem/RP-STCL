@@ -424,27 +424,39 @@ class LockClient(Sender):
         """
         Stops the loop running on the RedPitaya. This includes lock and scan loops.
 
+        For scan-mode RPs, also sends "stop_scan" first so Out2 is disabled
+        immediately on the board — the oscilloscope goes silent the moment
+        this call returns, regardless of loop state.
+
         Parameters
         ----------
         RP : str
             Key of the RedPitaya in question.
 
         """
-        # stops any loop
+        if self.RPs[RP].mode == "scan":
+            # Disable Out2 immediately, then stop the reaction_loop.
+            self.send(RP, "stop_scan")
         return self.send(RP, "stop")
 
-    @_check_cavity_scanned
     def start_scan(self, RP):
         """
-        starts repetitive scanning of the cavity without any locking.
-        Useful for monitoring of the cavity signal before the cavity is stabilized.
+        Start the cavity scan on RP.
+
+        Sends "start_scan" to RP_Server on the board, which:
+          1. Calls scan_output_enable() — Out2 triangle waveform fires immediately.
+          2. Enters the acquisition/PID reaction_loop.
+          3. Calls scan_output_disable() when the loop exits.
 
         Parameters
         ----------
         RP : str
             Key of the RedPitaya which scans the cavity.
         """
-        return self.start_loop(RP, "monitor")
+        if self.RPs[RP].loop_running:
+            print(f"Loop already running on {RP}! Stop it first.")
+            return
+        return self.start_loop(RP, "start_scan")
 
     @_check_for_loop
     def start_loop(self, RP, action):

@@ -344,6 +344,8 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
             "start_lock": self.action_start_lock,
             "start_lock2": self.action_start_lock,
             "start_lock3": self.action_start_lock,
+            "start_scan":  self.action_start_scan,
+            "stop_scan":   self.action_stop_scan,
             "test": self.action_test,
             "set": self.action_set,
             "stop": self.stop,
@@ -382,18 +384,72 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
         if self.RP_mode in ["scan", "lock"]:
             print("starting lock!")
             self.lock.start()  # starts the lock --> after that method is done, the lock is finished
-            # the below code is exectued after the lock is finished!
+            # the below code is executed after the lock is finished!
             print("lock stopped")
             for key, val in self.lock.settings.items():  # reset all PIDs
                 val["PID"].reset()
             print("PIDs reset")
-            self.lock.gen_ramp.offset = 0.0  # reset out1 offset to 0
+            self.lock.gen_ramp.offset = 0.0  # reset ramp offset to 0
             if self.RP_mode == "lock":
-                self.lock.gen_trig.offset = (
-                    0.0  # for laser lock only reset offset of out2 to 0
-                )
+                self.lock.gen_trig.offset = 0.0
+            if self.RP_mode == "scan":
+                self.lock.scan_output_disable()  # silence Out2 when lock stops
             print("outputs reset")
             return "Done!"
+
+    def action_start_scan(self, query):
+        """Enable Out2 waveform then run a bare acquisition loop on port 5065.
+
+        Mirrors action_monitor() exactly — a lightweight reaction_loop that
+        just calls acquire_ch(0) each iteration. Does NOT call lock.start()
+        so it never crashes on empty settings (the chicken-and-egg problem
+        where settings cannot be sent until the scan is running).
+
+        Sequence:
+          1. scan_output_enable()  — Out2 triangle fires immediately
+          2. reaction_loop opens port 5065 — PC sets loop_running = True
+          3. Loop iterates: acquire_ch(0) each cycle
+          4. "stop" command received → loop exits
+          5. scan_output_disable() — Out2 goes silent
+        """
+        if self.RP_mode != "scan":
+            return "action_start_scan: only valid in scan mode"
+
+        # Step 1 — enable Out2 synchronously before loop machinery starts
+        print("action_start_scan: enabling Out2")
+        self.lock.scan_output_enable()
+
+        # Step 2 — bare reaction_loop (identical structure to action_monitor)
+        addr = (self.addr[0], 5065)
+        rl = reaction_loop(addr)
+        rl.var_dict["i"] = 0
+
+        def iteration():
+            self.lock.acquire_ch(0)
+            rl.var_dict["i"] += 1
+
+        def rl_update_settings(settings):
+            self.lock.update_settings(settings)
+            return "settings updated"
+
+        rl.iteration = iteration
+        rl.action_dict["update_settings"] = rl_update_settings
+        rl.action_dict["set_dec"]         = self.action_set_dec
+
+        print("action_start_scan: loop starting on port 5065")
+        rl.start_loop()   # blocks until "stop" received on port 5065
+
+        # Step 5 — clean up after loop exits
+        print("action_start_scan: {} iterations done, disabling Out2".format(
+            rl.var_dict["i"]))
+        self.lock.gen_ramp.offset = 0.0
+        self.lock.scan_output_disable()
+        return "Done"
+
+    def action_stop_scan(self, query):
+        """Disable Out2 immediately — safe to call even if loop is not running."""
+        self.lock.scan_output_disable()
+        return "Out2 disabled"
 
     def action_close(self, query):
         self.server_running = False
@@ -751,15 +807,17 @@ class RP:
         rp.rp_GenTriggerSource(ch_trig, rp.RP_GEN_TRIG_SRC_INTERNAL)
         rp.rp_GenOutEnable(ch_trig)
 
-        # --- Out2: ramp (gen_ramp / RP_CH_2) ---
+        # --- Out2: scan ramp (gen_ramp / RP_CH_2) ---
+        # Frequency, amplitude and mode set here at init.
+        # Waveform shape and rp_GenOutEnable are deferred to scan_output_enable()
+        # so Out2 is silent until Lock.start_scan() explicitly fires it.
         ch_ramp = _CH[1]
-        rp.rp_GenWaveform(ch_ramp, rp.RP_WAVEFORM_RAMP_DOWN)  # OS 2.x: RAMP_DOWN is physically rising
         rp.rp_GenFreqDirect(ch_ramp, freq_hz)
         rp.rp_GenAmp(ch_ramp, 0.5)
         rp.rp_GenOffset(ch_ramp, 0.0)
         rp.rp_GenMode(ch_ramp, rp.RP_GEN_MODE_CONTINUOUS)
         rp.rp_GenTriggerSource(ch_ramp, rp.RP_GEN_TRIG_SRC_INTERNAL)
-        rp.rp_GenOutEnable(ch_ramp)
+        # rp_GenWaveform + rp_GenOutEnable → called in scan_output_enable()
 
     def _setup_gen_lock(self):
         """
@@ -778,6 +836,37 @@ class RP:
             rp.rp_GenMode(ch, rp.RP_GEN_MODE_CONTINUOUS)
             rp.rp_GenTriggerSource(ch, rp.RP_GEN_TRIG_SRC_INTERNAL)
             rp.rp_GenOutEnable(ch)
+
+    # ------------------------------------------------------------------
+    # Scan output control  (called from RP_Server action handlers)
+    # ------------------------------------------------------------------
+
+    def scan_output_enable(self, waveform=None):
+        """Write full Out2 generator config and enable its output.
+
+        Called synchronously at the start of action_start_scan() so the
+        waveform appears on the oscilloscope before the loop starts.
+        """
+        if waveform is None:
+            waveform = rp.RP_WAVEFORM_TRIANGLE
+        ch = _CH[1]
+        freq_hz = self._scan_freq_hz(self._dec)
+        rp.rp_GenWaveform(ch, waveform)
+        rp.rp_GenFreqDirect(ch, freq_hz)
+        rp.rp_GenAmp(ch, 0.5)
+        rp.rp_GenOffset(ch, 0.0)
+        rp.rp_GenMode(ch, rp.RP_GEN_MODE_CONTINUOUS)
+        rp.rp_GenTriggerSource(ch, rp.RP_GEN_TRIG_SRC_INTERNAL)
+        rp.rp_GenOutEnable(ch)
+        self._scan_waveform = waveform
+        print("scan_output_enable: Out2 ON  waveform={}  freq={:.1f} Hz".format(
+            waveform, freq_hz))
+
+    def scan_output_disable(self):
+        """Zero Out2 offset and disable its output immediately."""
+        rp.rp_GenOffset(_CH[1], 0.0)
+        rp.rp_GenOutDisable(_CH[1])
+        print("scan_output_disable: Out2 OFF")
 
     # ------------------------------------------------------------------
     # Public interface — matching the original RP class
@@ -806,7 +895,7 @@ class RP:
         self.times = np.linspace(0, dur - (8e-9 * dec), self.N) * 1e3
         self._dec = dec
 
-    def trigger(self):
+    def trigger(self, max_polls=200000):
         """
         Arm the ADC and wait for the next trigger edge.
 
@@ -817,17 +906,30 @@ class RP:
         of In2 (RP_TRIG_SRC_CHB_PE), driven by the cavity RP's Out1.
 
         The ADC is re-armed on every call so it catches the very next edge.
+
+        Parameters
+        ----------
+        max_polls : int
+            Maximum number of rp_AcqGetTriggerState() polls before giving up.
+            At ~1-5 µs per poll, 200000 polls ≈ 0.2-1 s — long enough to
+            survive any decimation setting, short enough that the scan loop
+            can still process a "stop" command within a few seconds even if
+            the trigger source is lost.
         """
         rp.rp_AcqStop()
         rp.rp_AcqSetTriggerSrc(self._trig_src)
         rp.rp_AcqSetTriggerDelay(self.N)
         rp.rp_AcqStart()
 
-        # Wait for trigger edge
-        while True:
+        # Wait for trigger edge — with timeout so the board loop is never
+        # permanently blocked and can always process incoming stop commands.
+        for _ in range(max_polls):
             _ret, state = rp.rp_AcqGetTriggerState()
             if state == rp.RP_TRIG_STATE_TRIGGERED:
-                break
+                return
+        # Timeout reached — log and return without data (acquire_ch returns
+        # whatever is in the buffer; the caller discards stale data).
+        print("trigger(): timeout waiting for ADC trigger — returning without trigger")
 
     def acquire(self):
         """
@@ -858,11 +960,14 @@ class RP:
         return arr
 
     def close(self):
-        """Release hardware resources."""
+        """Release hardware resources and silence all outputs."""
+        rp.rp_GenOffset(_CH[0], 0.0)
+        rp.rp_GenOffset(_CH[1], 0.0)
         rp.rp_GenOutDisable(_CH[0])
         rp.rp_GenOutDisable(_CH[1])
         rp.rp_AcqStop()
         rp.rp_Release()
+        print("RP.close(): all outputs disabled, hardware released")
 
 
 # ---------------------------------------------------------------------------
