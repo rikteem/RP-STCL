@@ -424,9 +424,8 @@ class LockClient(Sender):
         """
         Stops the loop running on the RedPitaya. This includes lock and scan loops.
 
-        For scan-mode RPs, also sends "stop_scan" first so Out2 is disabled
-        immediately on the board — the oscilloscope goes silent the moment
-        this call returns, regardless of loop state.
+        For scan-mode RPs, sends "stop_scan" first to disable Out2 immediately,
+        then sends "stop" to exit the reaction_loop on port 5065.
 
         Parameters
         ----------
@@ -435,35 +434,36 @@ class LockClient(Sender):
 
         """
         if self.RPs[RP].mode == "scan":
-            # Disable Out2 immediately, then stop the reaction_loop.
             self.send(RP, "stop_scan")
         return self.send(RP, "stop")
 
-    def start_scan(self, RP):
+    def start_scan(self, RP, amplitude=0.5, offset=0.0):
         """
-        Start the cavity scan on RP.
-
-        Sends "start_scan" to RP_Server on the board, which:
-          1. Calls scan_output_enable() — Out2 triangle waveform fires immediately.
-          2. Enters the acquisition/PID reaction_loop.
-          3. Calls scan_output_disable() when the loop exits.
+        Start the cavity scan: enables Out2 triangle waveform and acquisition loop.
 
         Parameters
         ----------
         RP : str
             Key of the RedPitaya which scans the cavity.
+        amplitude : float, optional
+            Half-swing of the triangle wave in volts. Default 0.5 V.
+            Output swings from (offset - amplitude) to (offset + amplitude).
+            Must satisfy: amplitude + abs(offset) <= 1.0
+        offset : float, optional
+            DC offset shifting the scan centre in volts. Default 0.0 V.
         """
         if self.RPs[RP].loop_running:
-            print(f"Loop already running on {RP}! Stop it first.")
+            print(f"Loop already running on {RP}! Call stop_loop('{RP}') first.")
             return
-        return self.start_loop(RP, "start_scan")
+        self.RPs[RP]._scan_amplitude = float(amplitude)
+        self.RPs[RP]._scan_offset    = float(offset)
+        value = {"amplitude": float(amplitude), "offset": float(offset)}
+        return self.start_loop(RP, "start_scan", value=value)
 
     @_check_for_loop
-    def start_loop(self, RP, action):
+    def start_loop(self, RP, action, value="Hello world!"):
         """
         Start any kind of loop on the RedPitaya remotely using this command.
-        This method runs the sending loop, which awaits a response,
-        in the backround using threading.
 
         Parameters
         ----------
@@ -471,15 +471,41 @@ class LockClient(Sender):
             Key of the RedPitaya in question.
         action : str
             Name of the action which starts a loop on RP.
-
+        value : any, optional
+            Value passed alongside the action (e.g. a dict of scan parameters).
         """
-        # Start any kind of loop remotely using this command.
-        # it runs the sending loop, which awaits a response, in the backround using threading.
         t = threading.Thread(
-            target=self.send, args=(RP, action), kwargs=dict(loop_action=True)
+            target=self.send, args=(RP, action),
+            kwargs=dict(loop_action=True, value=value)
         )
         t.daemon = True
         t.start()
+
+    def set_scan_output(self, RP, amplitude=None, offset=None):
+        """
+        Update Out2 amplitude and/or offset while the scan is running.
+        Takes effect immediately — no need to stop/restart the scan.
+
+        Parameters
+        ----------
+        RP : str
+            Key of the RedPitaya which is scanning.
+        amplitude : float, optional
+            New half-swing in volts. Omit to keep current value.
+        offset : float, optional
+            New DC offset in volts. Omit to keep current value.
+        """
+        if not self.RPs[RP].loop_running:
+            print(f"No scan running on {RP}. Start scan first.")
+            return
+        if amplitude is None:
+            amplitude = getattr(self.RPs[RP], "_scan_amplitude", 0.5)
+        if offset is None:
+            offset = getattr(self.RPs[RP], "_scan_offset", 0.0)
+        self.RPs[RP]._scan_amplitude = float(amplitude)
+        self.RPs[RP]._scan_offset    = float(offset)
+        value = {"amplitude": float(amplitude), "offset": float(offset)}
+        return self.send(RP, "set_scan_output", value=value)
 
     @_check_cavity_scanned  # only start lock if cavity is scanned.
     def start_lock(self, RP):

@@ -341,9 +341,12 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
             "monitor": self.action_monitor,
             "acquire_peaks_ch": self.action_acquire_peaks_ch,
             "update_settings": self.action_update_settings,
-            "start_lock": self.action_start_lock,
-            "start_lock2": self.action_start_lock,
-            "start_lock3": self.action_start_lock,
+            "start_lock":      self.action_start_lock,
+            "start_lock2":     self.action_start_lock,
+            "start_lock3":     self.action_start_lock,
+            "start_scan":      self.action_start_scan,
+            "stop_scan":       self.action_stop_scan,
+            "set_scan_output": self.action_set_scan_output,
             "start_scan":  self.action_start_scan,
             "stop_scan":   self.action_stop_scan,
             "test": self.action_test,
@@ -416,8 +419,18 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
             return "action_start_scan: only valid in scan mode"
 
         # Step 1 — enable Out2 synchronously before loop machinery starts
+        # query may carry amplitude/offset/waveform overrides as a dict
+        amplitude = None
+        offset    = None
+        waveform  = None
+        if isinstance(query, dict):
+            amplitude = query.get("amplitude", None)
+            offset    = query.get("offset",    None)
+            waveform  = query.get("waveform",  None)
         print("action_start_scan: enabling Out2")
-        self.lock.scan_output_enable()
+        self.lock.scan_output_enable(waveform=waveform,
+                                     amplitude=amplitude,
+                                     offset=offset)
 
         # Step 2 — bare reaction_loop (identical structure to action_monitor)
         addr = (self.addr[0], 5065)
@@ -450,6 +463,66 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
         """Disable Out2 immediately — safe to call even if loop is not running."""
         self.lock.scan_output_disable()
         return "Out2 disabled"
+
+    def action_start_scan(self, query):
+        """Enable Out2 waveform then run a bare acquisition loop on port 5065.
+
+        query may be a dict with keys: amplitude, offset, waveform.
+        Does NOT call lock.start() — avoids crash on empty settings.
+        """
+        if self.RP_mode != "scan":
+            return "action_start_scan: only valid in scan mode"
+        amplitude = None
+        offset    = None
+        waveform  = None
+        if isinstance(query, dict):
+            amplitude = query.get("amplitude", None)
+            offset    = query.get("offset",    None)
+            waveform  = query.get("waveform",  None)
+        print("action_start_scan: enabling Out2")
+        self.lock.scan_output_enable(waveform=waveform,
+                                     amplitude=amplitude,
+                                     offset=offset)
+        addr = (self.addr[0], 5065)
+        rl = reaction_loop(addr)
+        rl.var_dict["i"] = 0
+
+        def iteration():
+            self.lock.acquire_ch(0)
+            rl.var_dict["i"] += 1
+
+        def rl_update_settings(settings):
+            self.lock.update_settings(settings)
+            return "settings updated"
+
+        rl.iteration = iteration
+        rl.action_dict["update_settings"] = rl_update_settings
+        rl.action_dict["set_dec"]         = self.action_set_dec
+        print("action_start_scan: loop starting on port 5065")
+        rl.start_loop()
+        print("action_start_scan: {} iterations done, disabling Out2".format(
+            rl.var_dict["i"]))
+        self.lock.gen_ramp.offset = 0.0
+        self.lock.scan_output_disable()
+        return "Done"
+
+    def action_stop_scan(self, query):
+        """Disable Out2 immediately. Safe even if loop is not running."""
+        self.lock.scan_output_disable()
+        return "Out2 disabled"
+
+    def action_set_scan_output(self, query):
+        """Update Out2 amplitude/offset/waveform while scan is running.
+
+        query: dict with any of: "amplitude", "offset", "waveform"
+        """
+        if not isinstance(query, dict):
+            return "set_scan_output: query must be a dict"
+        self.lock.scan_output_enable(
+            waveform=query.get("waveform",  None),
+            amplitude=query.get("amplitude", None),
+            offset=query.get("offset",    None))
+        return "scan output updated"
 
     def action_close(self, query):
         self.server_running = False
@@ -841,29 +914,102 @@ class RP:
     # Scan output control  (called from RP_Server action handlers)
     # ------------------------------------------------------------------
 
-    def scan_output_enable(self, waveform=None):
+    def scan_output_enable(self, waveform=None, amplitude=None, offset=None):
         """Write full Out2 generator config and enable its output.
 
-        Called synchronously at the start of action_start_scan() so the
-        waveform appears on the oscilloscope before the loop starts.
+        Parameters
+        ----------
+        waveform : rp waveform constant, optional
+            Default: rp.RP_WAVEFORM_TRIANGLE
+        amplitude : float, optional
+            Half-swing of the waveform in volts. Default 0.5 V.
+            Output swings from (offset - amplitude) to (offset + amplitude).
+            Must satisfy: amplitude + abs(offset) <= 1.0  (RP clips at ±1 V).
+        offset : float, optional
+            DC offset that shifts the scan centre in volts. Default 0.0 V.
         """
         if waveform is None:
             waveform = rp.RP_WAVEFORM_TRIANGLE
+        if amplitude is None:
+            amplitude = self._scan_amplitude if hasattr(self, "_scan_amplitude") else 0.5
+        if offset is None:
+            offset = self._scan_offset if hasattr(self, "_scan_offset") else 0.0
+        amplitude = float(amplitude)
+        offset    = float(offset)
+        if amplitude + abs(offset) > 1.0:
+            amplitude = max(0.0, 1.0 - abs(offset))
+            print("scan_output_enable: WARNING amplitude clamped to {:.3f} V "
+                  "(amp + |offset| must be <= 1.0)".format(amplitude))
         ch = _CH[1]
         freq_hz = self._scan_freq_hz(self._dec)
         rp.rp_GenWaveform(ch, waveform)
         rp.rp_GenFreqDirect(ch, freq_hz)
-        rp.rp_GenAmp(ch, 0.5)
-        rp.rp_GenOffset(ch, 0.0)
+        rp.rp_GenAmp(ch, amplitude)
+        rp.rp_GenOffset(ch, offset)
         rp.rp_GenMode(ch, rp.RP_GEN_MODE_CONTINUOUS)
         rp.rp_GenTriggerSource(ch, rp.RP_GEN_TRIG_SRC_INTERNAL)
         rp.rp_GenOutEnable(ch)
-        self._scan_waveform = waveform
-        print("scan_output_enable: Out2 ON  waveform={}  freq={:.1f} Hz".format(
-            waveform, freq_hz))
+        self._scan_waveform  = waveform
+        self._scan_amplitude = amplitude
+        self._scan_offset    = offset
+        print("scan_output_enable: Out2 ON  waveform={}  amp={:.3f} V  "
+              "offset={:.3f} V  freq={:.1f} Hz".format(
+              waveform, amplitude, offset, freq_hz))
 
     def scan_output_disable(self):
         """Zero Out2 offset and disable its output immediately."""
+        rp.rp_GenOffset(_CH[1], 0.0)
+        rp.rp_GenOutDisable(_CH[1])
+        print("scan_output_disable: Out2 OFF")
+
+    # ------------------------------------------------------------------
+    # Scan output control
+    # ------------------------------------------------------------------
+
+    def scan_output_enable(self, waveform=None, amplitude=None, offset=None):
+        """Write full Out2 generator config and enable its output.
+
+        Parameters
+        ----------
+        waveform : rp waveform constant, optional
+            Default: rp.RP_WAVEFORM_TRIANGLE
+        amplitude : float, optional
+            Half-swing of the waveform in volts. Default 0.5 V.
+            Output swings from (offset-amplitude) to (offset+amplitude).
+            amplitude + abs(offset) must be <= 1.0 (RP clips at ±1 V).
+        offset : float, optional
+            DC offset shifting the scan centre in volts. Default 0.0 V.
+        """
+        if waveform is None:
+            waveform = rp.RP_WAVEFORM_TRIANGLE
+        if amplitude is None:
+            amplitude = self._scan_amplitude if hasattr(self, "_scan_amplitude") else 0.5
+        if offset is None:
+            offset = self._scan_offset if hasattr(self, "_scan_offset") else 0.0
+        amplitude = float(amplitude)
+        offset    = float(offset)
+        if amplitude + abs(offset) > 1.0:
+            amplitude = max(0.0, 1.0 - abs(offset))
+            print("scan_output_enable: WARNING amplitude clamped to {:.3f} V"
+                  .format(amplitude))
+        ch = _CH[1]
+        freq_hz = self._scan_freq_hz(self._dec)
+        rp.rp_GenWaveform(ch, waveform)
+        rp.rp_GenFreqDirect(ch, freq_hz)
+        rp.rp_GenAmp(ch, amplitude)
+        rp.rp_GenOffset(ch, offset)
+        rp.rp_GenMode(ch, rp.RP_GEN_MODE_CONTINUOUS)
+        rp.rp_GenTriggerSource(ch, rp.RP_GEN_TRIG_SRC_INTERNAL)
+        rp.rp_GenOutEnable(ch)
+        self._scan_waveform  = waveform
+        self._scan_amplitude = amplitude
+        self._scan_offset    = offset
+        print("scan_output_enable: Out2 ON  waveform={}  amp={:.3f} V  "
+              "offset={:.3f} V  freq={:.1f} Hz".format(
+              waveform, amplitude, offset, freq_hz))
+
+    def scan_output_disable(self):
+        """Zero Out2 offset and disable its output."""
         rp.rp_GenOffset(_CH[1], 0.0)
         rp.rp_GenOutDisable(_CH[1])
         print("scan_output_disable: Out2 OFF")
