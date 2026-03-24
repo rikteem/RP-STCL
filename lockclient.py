@@ -424,8 +424,9 @@ class LockClient(Sender):
         """
         Stops the loop running on the RedPitaya. This includes lock and scan loops.
 
-        For scan-mode RPs, sends "stop_scan" first to disable Out2 immediately,
-        then sends "stop" to exit the reaction_loop on port 5065.
+        For scan-mode RPs, sends "stop_scan" first to disable Out2 immediately.
+        This is wrapped in try/except because the main command port (5000) may
+        be unreachable at shutdown time — the "stop" on port 5065 still works.
 
         Parameters
         ----------
@@ -434,10 +435,13 @@ class LockClient(Sender):
 
         """
         if self.RPs[RP].mode == "scan":
-            self.send(RP, "stop_scan")
+            try:
+                self.send(RP, "stop_scan")
+            except Exception as e:
+                print(f"stop_loop: stop_scan failed (board may be unreachable): {e}")
         return self.send(RP, "stop")
 
-    def start_scan(self, RP, amplitude=0.5, offset=0.0):
+    def start_scan(self, RP, amplitude=0.5, offset=0.0, period_ms=None):
         """
         Start the cavity scan: enables Out2 triangle waveform and acquisition loop.
 
@@ -447,10 +451,12 @@ class LockClient(Sender):
             Key of the RedPitaya which scans the cavity.
         amplitude : float, optional
             Half-swing of the triangle wave in volts. Default 0.5 V.
-            Output swings from (offset - amplitude) to (offset + amplitude).
-            Must satisfy: amplitude + abs(offset) <= 1.0
+            Board supports HV mode: amplitude + abs(offset) <= 6.0 V.
         offset : float, optional
             DC offset shifting the scan centre in volts. Default 0.0 V.
+        period_ms : float or None, optional
+            Desired scan period in milliseconds. The board selects the closest
+            valid decimation automatically. None = keep current decimation.
         """
         if self.RPs[RP].loop_running:
             print(f"Loop already running on {RP}! Call stop_loop('{RP}') first.")
@@ -458,6 +464,8 @@ class LockClient(Sender):
         self.RPs[RP]._scan_amplitude = float(amplitude)
         self.RPs[RP]._scan_offset    = float(offset)
         value = {"amplitude": float(amplitude), "offset": float(offset)}
+        if period_ms is not None:
+            value["period_ms"] = float(period_ms)
         return self.start_loop(RP, "start_scan", value=value)
 
     @_check_for_loop
@@ -472,7 +480,7 @@ class LockClient(Sender):
         action : str
             Name of the action which starts a loop on RP.
         value : any, optional
-            Value passed alongside the action (e.g. a dict of scan parameters).
+            Value forwarded with the action (e.g. scan parameters dict).
         """
         t = threading.Thread(
             target=self.send, args=(RP, action),
@@ -481,9 +489,9 @@ class LockClient(Sender):
         t.daemon = True
         t.start()
 
-    def set_scan_output(self, RP, amplitude=None, offset=None):
+    def set_scan_output(self, RP, amplitude=None, offset=None, period_ms=None):
         """
-        Update Out2 amplitude and/or offset while the scan is running.
+        Update scan output parameters while the scan is running.
         Takes effect immediately — no need to stop/restart the scan.
 
         Parameters
@@ -494,6 +502,8 @@ class LockClient(Sender):
             New half-swing in volts. Omit to keep current value.
         offset : float, optional
             New DC offset in volts. Omit to keep current value.
+        period_ms : float, optional
+            New scan period in milliseconds. Omit to keep current value.
         """
         if not self.RPs[RP].loop_running:
             print(f"No scan running on {RP}. Start scan first.")
@@ -505,6 +515,8 @@ class LockClient(Sender):
         self.RPs[RP]._scan_amplitude = float(amplitude)
         self.RPs[RP]._scan_offset    = float(offset)
         value = {"amplitude": float(amplitude), "offset": float(offset)}
+        if period_ms is not None:
+            value["period_ms"] = float(period_ms)
         return self.send(RP, "set_scan_output", value=value)
 
     @_check_cavity_scanned  # only start lock if cavity is scanned.

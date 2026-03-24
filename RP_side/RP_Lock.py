@@ -427,6 +427,9 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
             amplitude = query.get("amplitude", None)
             offset    = query.get("offset",    None)
             waveform  = query.get("waveform",  None)
+            period_ms = query.get("period_ms", None)
+        if period_ms is not None:
+            self.lock.set_scan_period(float(period_ms))
         print("action_start_scan: enabling Out2")
         self.lock.scan_output_enable(waveform=waveform,
                                      amplitude=amplitude,
@@ -445,9 +448,26 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
             self.lock.update_settings(settings)
             return "settings updated"
 
+        def rl_set_scan_output(query):
+            """Handle set_scan_output on port 5065 (the loop socket).
+            Without this entry in rl.action_dict the command arrives but gets
+            no handler, so libserver never sends a response and the PC-side
+            send() blocks forever — causing the >1 min hang.
+            """
+            if not isinstance(query, dict):
+                return "set_scan_output: query must be a dict"
+            if "period_ms" in query:
+                self.lock.set_scan_period(float(query["period_ms"]))
+            self.lock.scan_output_enable(
+                waveform=query.get("waveform",   None),
+                amplitude=query.get("amplitude", None),
+                offset=query.get("offset",       None))
+            return "scan output updated"
+
         rl.iteration = iteration
         rl.action_dict["update_settings"] = rl_update_settings
         rl.action_dict["set_dec"]         = self.action_set_dec
+        rl.action_dict["set_scan_output"] = rl_set_scan_output  # fixes hang
 
         print("action_start_scan: loop starting on port 5065")
         rl.start_loop()   # blocks until "stop" received on port 5065
@@ -479,6 +499,9 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
             amplitude = query.get("amplitude", None)
             offset    = query.get("offset",    None)
             waveform  = query.get("waveform",  None)
+            period_ms = query.get("period_ms", None)
+        if period_ms is not None:
+            self.lock.set_scan_period(float(period_ms))
         print("action_start_scan: enabling Out2")
         self.lock.scan_output_enable(waveform=waveform,
                                      amplitude=amplitude,
@@ -512,16 +535,18 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
         return "Out2 disabled"
 
     def action_set_scan_output(self, query):
-        """Update Out2 amplitude/offset/waveform while scan is running.
+        """Update Out2 amplitude/offset/waveform/period while scan is running.
 
-        query: dict with any of: "amplitude", "offset", "waveform"
+        query: dict with any of: "amplitude", "offset", "waveform", "period_ms"
         """
         if not isinstance(query, dict):
             return "set_scan_output: query must be a dict"
+        if "period_ms" in query:
+            self.lock.set_scan_period(float(query["period_ms"]))
         self.lock.scan_output_enable(
-            waveform=query.get("waveform",  None),
+            waveform=query.get("waveform",   None),
             amplitude=query.get("amplitude", None),
-            offset=query.get("offset",    None))
+            offset=query.get("offset",       None))
         return "scan output updated"
 
     def action_close(self, query):
@@ -789,8 +814,8 @@ class RP:
         # --- configure acquisition (all modes) ---
         rp.rp_AcqReset()
         rp.rp_AcqSetDecimation(_DEC_MAP[dec])
-        rp.rp_AcqSetGain(rp.RP_CH_1, rp.RP_LOW)   # In1: ±1 V  (cavity signal)
-        rp.rp_AcqSetGain(rp.RP_CH_2, rp.RP_LOW)   # In2: ±1 V
+        rp.rp_AcqSetGain(rp.RP_CH_1, rp.RP_HIGH)  # In1: ±20 V (HV mode)
+        rp.rp_AcqSetGain(rp.RP_CH_2, rp.RP_HIGH)  # In2: ±20 V (HV mode)
         rp.rp_AcqSetAveraging(True)
         # Trigger source depends on mode:
         #   scan    — ADC triggers on local AWG positive edge (Out1 square wave
@@ -936,10 +961,12 @@ class RP:
             offset = self._scan_offset if hasattr(self, "_scan_offset") else 0.0
         amplitude = float(amplitude)
         offset    = float(offset)
-        if amplitude + abs(offset) > 1.0:
-            amplitude = max(0.0, 1.0 - abs(offset))
+        # HV mode: generator supports up to ±6 V with RP_GAIN_2X.
+        # Clamp at 6V for safety.
+        if amplitude + abs(offset) > 6.0:
+            amplitude = max(0.0, 6.0 - abs(offset))
             print("scan_output_enable: WARNING amplitude clamped to {:.3f} V "
-                  "(amp + |offset| must be <= 1.0)".format(amplitude))
+                  "(amp + |offset| must be <= 6.0 V in HV mode)".format(amplitude))
         ch = _CH[1]
         freq_hz = self._scan_freq_hz(self._dec)
         rp.rp_GenWaveform(ch, waveform)
@@ -948,6 +975,7 @@ class RP:
         rp.rp_GenOffset(ch, offset)
         rp.rp_GenMode(ch, rp.RP_GEN_MODE_CONTINUOUS)
         rp.rp_GenTriggerSource(ch, rp.RP_GEN_TRIG_SRC_INTERNAL)
+        rp.rp_GenSetGainOut(ch, rp.RP_GAIN_2X)  # enable HV output (±6 V range)
         rp.rp_GenOutEnable(ch)
         self._scan_waveform  = waveform
         self._scan_amplitude = amplitude
@@ -1013,6 +1041,26 @@ class RP:
         rp.rp_GenOffset(_CH[1], 0.0)
         rp.rp_GenOutDisable(_CH[1])
         print("scan_output_disable: Out2 OFF")
+
+    def set_scan_period(self, period_ms):
+        """Set the scan period in ms by selecting the closest valid decimation.
+
+        T = N * dec * 8 ns  (N=16384, clock=125 MHz).
+        Finds the dec whose period is closest to period_ms, then updates
+        ADC decimation, time axis, and both generator frequencies atomically.
+
+        Parameters
+        ----------
+        period_ms : float
+            Desired scan period in milliseconds.
+        """
+        period_s = float(period_ms) * 1e-3
+        best_dec = min(_DEC_MAP.keys(),
+                       key=lambda d: abs(8e-9 * self.N * d - period_s))
+        actual_ms = 8e-9 * self.N * best_dec * 1e3
+        print("set_scan_period: requested={:.3f} ms  dec={}  actual={:.3f} ms".format(
+            period_ms, best_dec, actual_ms))
+        self.set_dec(best_dec)   # updates ADC dec + time axis + gen freq
 
     # ------------------------------------------------------------------
     # Public interface — matching the original RP class
