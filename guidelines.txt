@@ -44,6 +44,17 @@ then do this:
     "systemctl restart systemd-networkd"
     "reboot"
 
+    If you are getting this error 
+    '''
+    Host key for 192.168.0.99 has changed and you have requested strict checking.
+    Host key verification failed.
+
+    '''
+    then do this
+    "ssh-keygen -R 192.168.0.<your_ip>"
+
+    Now you can ssh to your board again, it will ask for fingerprint reset. Allow that.
+
     3. If done through serial port and arp -a still not updated then:
     a. Check if you have put an addr out of 0-255 range
     b. Check if your laptop's IP in 192.168.0.x not anything else by CMD->ipconfig
@@ -58,3 +69,25 @@ then do this:
     4. sleep 2
 
     then restart kernel and re-run cells.
+
+    Issue 3: If you want to check what's happening on the port do this:
+
+    1. ssh to board
+    2. "PYTHONPATH=/opt/redpitaya/lib/python/:$PYTHONPATH python3 /root/RunLock.py"
+    the logs will appear.
+
+    Issue 4: If Calibration Page doesn't open then (The EEPROM calibration data on this board is corrupt/empty for the new OS format. OS 2.07-48 uses a new universal calibration format that your board's EEPROM doesn't have — so rp_Init() gets zero gains, hits divide-by-zero, and kills the nginx worker instantly.):
+    1. Update OS from browser in Settings.
+    2. Use this prompt in Claude to run diagnostics and find failure:
+    "I have this serious problem with a RP board, which is STEMlab 125-14 V1.1. I recently flashed it with OS 2.07-48 stable. Then I opened the web browser for calibration, but the calibration page doesn't open. Also the Oscilloscope page doesn't open. I wish to debug this issue and fix it such that I can calibrate. the board. Let me know what all things you will need from me to run diagnostics and debug"
+    3. Fix Calibration File
+    # Stop nginx first
+    systemctl stop redpitaya_nginx.service
+
+    # Write factory default calibration values
+    /opt/redpitaya/bin/calib -d
+    echo "calib -d exit: $?"
+
+    # Verify calibration is now valid
+    /opt/redpitaya/bin/calib -r 2>&1 | head -5
+    4. 

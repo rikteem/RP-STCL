@@ -423,6 +423,7 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
         amplitude = None
         offset    = None
         waveform  = None
+        period_ms = None   # must be initialised before the isinstance block
         if isinstance(query, dict):
             amplitude = query.get("amplitude", None)
             offset    = query.get("offset",    None)
@@ -481,56 +482,6 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
 
     def action_stop_scan(self, query):
         """Disable Out2 immediately — safe to call even if loop is not running."""
-        self.lock.scan_output_disable()
-        return "Out2 disabled"
-
-    def action_start_scan(self, query):
-        """Enable Out2 waveform then run a bare acquisition loop on port 5065.
-
-        query may be a dict with keys: amplitude, offset, waveform.
-        Does NOT call lock.start() — avoids crash on empty settings.
-        """
-        if self.RP_mode != "scan":
-            return "action_start_scan: only valid in scan mode"
-        amplitude = None
-        offset    = None
-        waveform  = None
-        if isinstance(query, dict):
-            amplitude = query.get("amplitude", None)
-            offset    = query.get("offset",    None)
-            waveform  = query.get("waveform",  None)
-            period_ms = query.get("period_ms", None)
-        if period_ms is not None:
-            self.lock.set_scan_period(float(period_ms))
-        print("action_start_scan: enabling Out2")
-        self.lock.scan_output_enable(waveform=waveform,
-                                     amplitude=amplitude,
-                                     offset=offset)
-        addr = (self.addr[0], 5065)
-        rl = reaction_loop(addr)
-        rl.var_dict["i"] = 0
-
-        def iteration():
-            self.lock.acquire_ch(0)
-            rl.var_dict["i"] += 1
-
-        def rl_update_settings(settings):
-            self.lock.update_settings(settings)
-            return "settings updated"
-
-        rl.iteration = iteration
-        rl.action_dict["update_settings"] = rl_update_settings
-        rl.action_dict["set_dec"]         = self.action_set_dec
-        print("action_start_scan: loop starting on port 5065")
-        rl.start_loop()
-        print("action_start_scan: {} iterations done, disabling Out2".format(
-            rl.var_dict["i"]))
-        self.lock.gen_ramp.offset = 0.0
-        self.lock.scan_output_disable()
-        return "Done"
-
-    def action_stop_scan(self, query):
-        """Disable Out2 immediately. Safe even if loop is not running."""
         self.lock.scan_output_disable()
         return "Out2 disabled"
 
@@ -949,7 +900,7 @@ class RP:
         amplitude : float, optional
             Half-swing of the waveform in volts. Default 0.5 V.
             Output swings from (offset - amplitude) to (offset + amplitude).
-            Must satisfy: amplitude + abs(offset) <= 1.0  (RP clips at ±1 V).
+            LV mode: amplitude + abs(offset) must be <= 1.0 V.
         offset : float, optional
             DC offset that shifts the scan centre in volts. Default 0.0 V.
         """
@@ -961,22 +912,38 @@ class RP:
             offset = self._scan_offset if hasattr(self, "_scan_offset") else 0.0
         amplitude = float(amplitude)
         offset    = float(offset)
-        # HV mode: generator supports up to ±6 V with RP_GAIN_2X.
-        # Clamp at 6V for safety.
-        if amplitude + abs(offset) > 6.0:
-            amplitude = max(0.0, 6.0 - abs(offset))
+        # LV mode: generator output is clamped to ±1 V.
+        if amplitude + abs(offset) > 1.0:
+            amplitude = max(0.0, 1.0 - abs(offset))
             print("scan_output_enable: WARNING amplitude clamped to {:.3f} V "
-                  "(amp + |offset| must be <= 6.0 V in HV mode)".format(amplitude))
+                  "(amp + |offset| must be <= 1.0 V in LV mode)".format(amplitude))
         ch = _CH[1]
         freq_hz = self._scan_freq_hz(self._dec)
-        rp.rp_GenWaveform(ch, waveform)
+
+        # On OS 2.x, several rp_Gen*() calls reset the AWG state machine for
+        # the entire channel pair (Ch1 and Ch2 share the same AWG clock
+        # domain). The problematic calls are:
+        #   - rp_GenWaveform()      — reloads the waveform table
+        #   - rp_GenMode()          — resets generator phase
+        #   - rp_GenTriggerSource() — re-latches the trigger interlock
+        # Any of these called on Ch2 while Ch1's square wave is actively
+        # triggering the ADC causes a momentary gap in the trigger signal.
+        # The ADC poll times out, and after a few such interruptions the AWG
+        # enters an inconsistent state and the output dies.
+        # Fix: only issue each call when the value actually changes.
+        _first_call = not hasattr(self, "_scan_waveform")
+        if _first_call or waveform != self._scan_waveform:
+            rp.rp_GenWaveform(ch, waveform)
         rp.rp_GenFreqDirect(ch, freq_hz)
         rp.rp_GenAmp(ch, amplitude)
         rp.rp_GenOffset(ch, offset)
-        rp.rp_GenMode(ch, rp.RP_GEN_MODE_CONTINUOUS)
-        rp.rp_GenTriggerSource(ch, rp.RP_GEN_TRIG_SRC_INTERNAL)
-        rp.rp_GenSetGainOut(ch, rp.RP_GAIN_2X)  # enable HV output (±6 V range)
-        rp.rp_GenOutEnable(ch)
+        if _first_call:
+            # Only set mode and trigger source on the very first enable call.
+            # These registers do not need re-writing on subsequent updates and
+            # calling them resets the AWG phase, disrupting the trigger.
+            rp.rp_GenMode(ch, rp.RP_GEN_MODE_CONTINUOUS)
+            rp.rp_GenTriggerSource(ch, rp.RP_GEN_TRIG_SRC_INTERNAL)
+            rp.rp_GenOutEnable(ch)
         self._scan_waveform  = waveform
         self._scan_amplitude = amplitude
         self._scan_offset    = offset
@@ -988,58 +955,11 @@ class RP:
         """Zero Out2 offset and disable its output immediately."""
         rp.rp_GenOffset(_CH[1], 0.0)
         rp.rp_GenOutDisable(_CH[1])
-        print("scan_output_disable: Out2 OFF")
-
-    # ------------------------------------------------------------------
-    # Scan output control
-    # ------------------------------------------------------------------
-
-    def scan_output_enable(self, waveform=None, amplitude=None, offset=None):
-        """Write full Out2 generator config and enable its output.
-
-        Parameters
-        ----------
-        waveform : rp waveform constant, optional
-            Default: rp.RP_WAVEFORM_TRIANGLE
-        amplitude : float, optional
-            Half-swing of the waveform in volts. Default 0.5 V.
-            Output swings from (offset-amplitude) to (offset+amplitude).
-            amplitude + abs(offset) must be <= 1.0 (RP clips at ±1 V).
-        offset : float, optional
-            DC offset shifting the scan centre in volts. Default 0.0 V.
-        """
-        if waveform is None:
-            waveform = rp.RP_WAVEFORM_TRIANGLE
-        if amplitude is None:
-            amplitude = self._scan_amplitude if hasattr(self, "_scan_amplitude") else 0.5
-        if offset is None:
-            offset = self._scan_offset if hasattr(self, "_scan_offset") else 0.0
-        amplitude = float(amplitude)
-        offset    = float(offset)
-        if amplitude + abs(offset) > 1.0:
-            amplitude = max(0.0, 1.0 - abs(offset))
-            print("scan_output_enable: WARNING amplitude clamped to {:.3f} V"
-                  .format(amplitude))
-        ch = _CH[1]
-        freq_hz = self._scan_freq_hz(self._dec)
-        rp.rp_GenWaveform(ch, waveform)
-        rp.rp_GenFreqDirect(ch, freq_hz)
-        rp.rp_GenAmp(ch, amplitude)
-        rp.rp_GenOffset(ch, offset)
-        rp.rp_GenMode(ch, rp.RP_GEN_MODE_CONTINUOUS)
-        rp.rp_GenTriggerSource(ch, rp.RP_GEN_TRIG_SRC_INTERNAL)
-        rp.rp_GenOutEnable(ch)
-        self._scan_waveform  = waveform
-        self._scan_amplitude = amplitude
-        self._scan_offset    = offset
-        print("scan_output_enable: Out2 ON  waveform={}  amp={:.3f} V  "
-              "offset={:.3f} V  freq={:.1f} Hz".format(
-              waveform, amplitude, offset, freq_hz))
-
-    def scan_output_disable(self):
-        """Zero Out2 offset and disable its output."""
-        rp.rp_GenOffset(_CH[1], 0.0)
-        rp.rp_GenOutDisable(_CH[1])
+        # Clear cached waveform so the next scan_output_enable() call treats
+        # itself as a first call and re-issues rp_GenWaveform / rp_GenMode /
+        # rp_GenTriggerSource / rp_GenOutEnable from scratch.
+        if hasattr(self, "_scan_waveform"):
+            del self._scan_waveform
         print("scan_output_disable: Out2 OFF")
 
     def set_scan_period(self, period_ms):
@@ -1075,8 +995,21 @@ class RP:
                     dec, sorted(_DEC_MAP.keys())
                 )
             )
-        # Update oscilloscope decimation
+        # On OS 2.x, rp_AcqSetDecimation resets the ADC state machine and
+        # clears the trigger source register back to RP_TRIG_SRC_DISABLED.
+        # Without an explicit re-arm here, the next trigger() call polls
+        # forever (all timeouts) because the ADC never fires — the period
+        # update appears to do nothing on the oscilloscope even though
+        # rp_GenFreqDirect succeeds.
+        # Fix: reset and fully re-arm the ADC immediately after changing
+        # decimation so trigger() finds it in a clean, ready state.
+        # Changing decimation resets the ADC trigger source register.
+        # Re-arm immediately after using the correct OS 2.x sequence:
+        # SetDecimation → SetTriggerDelay → AcqStart → SetTriggerSrc.
         rp.rp_AcqSetDecimation(_DEC_MAP[dec])
+        rp.rp_AcqSetTriggerDelay(self.N)
+        rp.rp_AcqStart()
+        rp.rp_AcqSetTriggerSrc(self._trig_src)
 
         # Update generator frequency (scan mode only — both are continuous)
         if self.mode == "scan":
@@ -1088,6 +1021,8 @@ class RP:
         dur = self._duration(dec)
         self.times = np.linspace(0, dur - (8e-9 * dec), self.N) * 1e3
         self._dec = dec
+        print("set_dec: dec={}  period={:.3f} ms  freq={:.1f} Hz".format(
+            dec, dur * 1e3, self._scan_freq_hz(dec) if self.mode == "scan" else 0))
 
     def trigger(self, max_polls=200000):
         """
@@ -1110,10 +1045,16 @@ class RP:
             can still process a "stop" command within a few seconds even if
             the trigger source is lost.
         """
-        rp.rp_AcqStop()
-        rp.rp_AcqSetTriggerSrc(self._trig_src)
-        rp.rp_AcqSetTriggerDelay(self.N)
+        # Correct re-arm sequence on OS 2.x (confirmed from RP forum/docs):
+        #   1. rp_AcqStart()         — begin buffering, FPGA waits for trigger
+        #   2. rp_AcqSetTriggerSrc() — arm the trigger source AFTER start
+        # If SetTriggerSrc is called BEFORE Start, the hardware resets the
+        # trigger source to RP_TRIG_SRC_DISABLED when the previous acquisition
+        # completes, so the next armed source is never seen and polls time out.
+        # Do NOT call rp_AcqStop() here — it de-registers the AWG->ADC internal
+        # coupling and RP_TRIG_SRC_AWG_PE never fires again.
         rp.rp_AcqStart()
+        rp.rp_AcqSetTriggerSrc(self._trig_src)
 
         # Wait for trigger edge — with timeout so the board loop is never
         # permanently blocked and can always process incoming stop commands.

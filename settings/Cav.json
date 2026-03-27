@@ -22,7 +22,7 @@
         ],
         "lockpoint": 1.8,
         "enabled": true,
-        "dec": 16,
+        "dec": 32,
         "peak_finder": {
             "name": "SG_deriv",
             "window_size": 21,
