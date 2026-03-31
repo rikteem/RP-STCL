@@ -635,13 +635,41 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
             print("updated settings: {}".format(rl.var_dict["settings"]))
             return "updated settings!"
 
+        # Cache for both channels — populated each iteration, served to PC
+        # via action_acquire_ch without re-triggering the ADC.
+        rl.var_dict["ch_cache"] = {0: None, 1: None}
+
         def iteration():
-            self.lock.acquire_ch(0)
+            # Acquire both channels in one trigger cycle so that PC-side
+            # acquire_ch calls for ch0 AND ch1 are served from the same
+            # triggered buffer — no extra trigger() call per channel.
+            self.lock.trigger()
+            import rp as _rp
+            _ret, trig_pos = _rp.rp_AcqGetWritePointerAtTrig()
+            import numpy as _np
+            arr0 = _np.zeros(self.lock.N, dtype=_np.float32)
+            arr1 = _np.zeros(self.lock.N, dtype=_np.float32)
+            _rp.rp_AcqGetDataVNP(_rp.RP_CH_1, trig_pos, arr0)
+            _rp.rp_AcqGetDataVNP(_rp.RP_CH_2, trig_pos, arr1)
+            rl.var_dict["ch_cache"][0] = arr0
+            rl.var_dict["ch_cache"][1] = arr1
+            self.lock.acquisition = arr0   # keep .acquisition consistent (IN1)
             rl.var_dict["i"] += 1
+
+        # Override action_acquire_ch to serve from cache (no extra trigger)
+        def cached_acquire_ch(query):
+            ch = int(query)
+            cached = rl.var_dict["ch_cache"].get(ch)
+            if cached is None:
+                # Cache not yet populated — fall back to live acquire
+                cached = self.lock.acquire_ch(ch)
+            duration = self.lock.times[-1]
+            return [duration, cached.tolist()]
 
         rl.action_dict["give"] = give
         rl.action_dict["update_settings"] = update_settings
         rl.action_dict["set_dec"] = self.action_set_dec
+        rl.action_dict["acquire_ch"] = cached_acquire_ch
         rl.iteration = iteration
         rl.start_loop()
         t = perf_counter() - t0
@@ -1022,7 +1050,7 @@ class RP:
         self.times = np.linspace(0, dur - (8e-9 * dec), self.N) * 1e3
         self._dec = dec
         print("set_dec: dec={}  period={:.3f} ms  freq={:.1f} Hz".format(
-            dec, dur * 1e3, self._scan_freq_hz(dec) if self.mode == "scan" else 0))
+            dec, dur * 1e3, self._scan_freq_hz(dec)))
 
     def trigger(self, max_polls=200000):
         """

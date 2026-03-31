@@ -1132,6 +1132,9 @@ class LockClient(Sender):
 
 
 class Monitor(Sender):
+    # ── class-level flag: set to False before start_monitor() to hide trigger ──
+    show_trigger = True
+
     def __init__(self, RP, queue, settings, bool_var=None):
         Sender.__init__(self)
         self.mode = "monitor"
@@ -1141,6 +1144,9 @@ class Monitor(Sender):
         self.settings = settings
         self.monitor_running = bool_var  # a shared boolean variable
         self.filter = False
+        # snapshot the class flag at construction time so the child process
+        # gets a stable value even if the parent later changes it
+        self._show_trigger = self.__class__.show_trigger
 
     ################ Cavity monitoring related functions ######################
     def stop_monitor(self, event):
@@ -1181,8 +1187,18 @@ class Monitor(Sender):
         self.times = np.linspace(0, dur, 2**14)  # in ms
         # save data in dictionary
         self.data = dict(
-            Cavity=np.array([self.times[1:], self.acquisition[1:]]),
+            Cavity=np.array([self.times[1:], np.array(self.acquisition)[1:]]),
         )
+        if self._show_trigger:
+            try:
+                a1 = self.RP.send(self, "acquire_ch", value="1")
+                _, ch1 = a1
+                self._trigger_data = np.array(ch1)
+            except Exception:
+                self._trigger_data = np.zeros(len(self.acquisition))
+            self.data["Trigger"] = np.array(
+                [self.times[1:], self._trigger_data[1:]]
+            )
         if self.filter:
             self.filter_signals()
 
@@ -1210,29 +1226,86 @@ class Monitor(Sender):
 
     def set_monitor_title(self):
         if type(self.settings["Master"]) == str:
-            title = f'Cavity Monitor - {self.settings["Master"]}'  # This case is currently never true...
+            title = f'Cavity Monitor - {self.settings["Master"]}'
         else:
             title = f"Cavity Monitor - {self.RP.label}"
-        self._fig.canvas.manager.set_window_title(title)
+        try:
+            dec = self.settings["Master"]["dec"]
+            period_ms = 8e-9 * 16384 * dec * 1e3
+            title += f"   |   dec={dec}   period={period_ms:.3f} ms"
+        except Exception:
+            pass
+        trig_label = "  [trigger ON]" if self._show_trigger else "  [trigger OFF]"
+        self._fig.canvas.manager.set_window_title(title + trig_label)
+        try:
+            self._fig.suptitle(
+                title, color="#cdd6f4", fontsize=10, y=0.99, fontweight="bold"
+            )
+        except Exception:
+            pass
 
     def _decorate_figure(self):
-        # an estimate for initial ylims based on the detected signal
+        # ylim from actual signal range with 15% padding
         acq = self.data["Cavity"][1]
-        ymin = max(acq) - (max(acq) - min(acq)) * 1.2
-        ymax = max(acq) - min(acq) * 3 + min(acq)
+        span = max(acq) - min(acq) if max(acq) != min(acq) else 1.0
+        ymin = min(acq) - span * 0.15
+        ymax = max(acq) + span * 0.15
         self._ax.set_ylim(ymin, ymax)
-        self._ax.set_xlabel("Time [ms]")
-        self._ax.set_ylabel("Voltage [V]")
-        self._ax.grid()
+        self._ax.set_ylabel("IN1 — Cavity  [V]", color="#cdd6f4", fontsize=9)
+        self._ax.legend(
+            loc="upper right", fontsize=8,
+            facecolor="#313244", edgecolor="#45475a", labelcolor="#cdd6f4"
+        )
+        if self._show_trigger and hasattr(self, "_ax2") and self._ax2 is not None:
+            trig = self.data["Trigger"][1]
+            t_span = max(trig) - min(trig) if max(trig) != min(trig) else 1.0
+            self._ax2.set_ylim(min(trig) - t_span * 0.3, max(trig) + t_span * 0.3)
+            self._ax2.set_ylabel("IN2 — Trigger  [V]", color="#cdd6f4", fontsize=9)
+            self._ax2.set_xlabel("Time  [ms]", color="#cdd6f4", fontsize=9)
+            self._ax2.legend(
+                loc="upper right", fontsize=8,
+                facecolor="#313244", edgecolor="#45475a", labelcolor="#cdd6f4"
+            )
+        else:
+            self._ax.set_xlabel("Time  [ms]", color="#cdd6f4", fontsize=9)
 
     def _setup_figure(self):
-        self._fig, self._ax = plt.subplots(1, 1, figsize=(7 * golden, 7))
+        plt.style.use("dark_background")
+        # ── dual-axis layout when trigger is enabled ──────────────────────────
+        if self._show_trigger:
+            self._fig, (self._ax, self._ax2) = plt.subplots(
+                2, 1, figsize=(7 * golden, 7),
+                sharex=True,
+                gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08},
+            )
+            _axes = (self._ax, self._ax2)
+        else:
+            self._fig, self._ax = plt.subplots(1, 1, figsize=(7 * golden, 6))
+            self._ax2 = None
+            _axes = (self._ax,)
+        # ── dark styling on all axes ──────────────────────────────────────────
+        self._fig.patch.set_facecolor("#1e1e2e")
+        for ax in _axes:
+            ax.set_facecolor("#181825")
+            ax.tick_params(colors="#cdd6f4", labelsize=9)
+            ax.spines[:].set_color("#45475a")
+            ax.grid(True, color="#313244", linewidth=0.6, linestyle="--")
         self.set_monitor_title()
         self.acquire()  # acquire the signal once
         self._lines = []
-        for key, val in self.data.items():
-            l = self._ax.plot(val[0], val[1], label=key)
-            self._lines.append(l[0])
+        # cavity trace — always on self._ax
+        l0, = self._ax.plot(
+            self.data["Cavity"][0], self.data["Cavity"][1],
+            color="#4fc3f7", lw=1.0, label="IN1 — Cavity"
+        )
+        self._lines.append(l0)
+        # trigger trace — only on self._ax2 when enabled
+        if self._show_trigger and self._ax2 is not None:
+            l1, = self._ax2.plot(
+                self.data["Trigger"][0], self.data["Trigger"][1],
+                color="#a5d6a7", lw=0.9, label="IN2 — Trigger"
+            )
+            self._lines.append(l1)
         self._decorate_figure()
 
     def setup_monitor(self):
@@ -1290,39 +1363,52 @@ class Monitor(Sender):
         self._setrefs = []  # used for collecting line references
         ymin, ymax = self._ax.get_ylim()  # get the current ylim
         xlim = self._ax.get_xlim()
-        i = 1  # counting integer used for coloring
+        _C_RANGE  = "#90caf9"   # pale blue — range spans
+        _C_LOCKPT = "#ffb74d"   # amber     — Master lockpoint
+        _C_SLAVE  = ["#ef9a9a", "#ce93d8", "#80cbc4"]
+        slave_idx = 0
         for key, val in self.settings.items():
             if val["enabled"]:
                 if key == "Master":
-                    c = "k"
-                    for R in val[
-                        "range"
-                    ]:  # indicate ranges using axvspan and setpoints using vlines
-                        ref = plt.axvspan(
-                            self.times[R[0]], self.times[R[1]], alpha=0.2, facecolor=c
+                    c_span = _C_RANGE
+                    c_line = _C_LOCKPT
+                    for R in val["range"]:
+                        ref = self._ax.axvspan(
+                            self.times[R[0]], self.times[R[1]],
+                            alpha=0.18, facecolor=c_span, edgecolor="none"
                         )
                         self._setrefs.append(ref)
                 else:
-                    c = f"C{i}"
+                    c_span = _C_SLAVE[slave_idx % len(_C_SLAVE)]
+                    c_line = _C_SLAVE[slave_idx % len(_C_SLAVE)]
+                    slave_idx += 1
                     R = val["range"]
-                    ref = plt.axvspan(
-                        self.times[R[0]], self.times[R[1]], alpha=0.2, facecolor=c
+                    ref = self._ax.axvspan(
+                        self.times[R[0]], self.times[R[1]],
+                        alpha=0.18, facecolor=c_span, edgecolor="none"
                     )
                     self._setrefs.append(ref)
-                ref = plt.vlines(
-                    [val["lockpoint"]], -1, 1, color=c, label=self.create_label(key)
+                # vlines uses actual ylim so lines are always visible
+                ref = self._ax.vlines(
+                    [val["lockpoint"]], ymin, ymax,
+                    color=c_line, lw=1.5, ls="--",
+                    label=self.create_label(key)
                 )
                 self._setrefs.append(ref)
-                i += 1
         self._ax.set_xlim(xlim)
         self._ax.set_ylim(ymin, ymax)
         self._ax.relim()
-        self._ax.legend()
+        self._ax.legend(
+            loc="upper right", fontsize=8,
+            facecolor="#313244", edgecolor="#45475a", labelcolor="#cdd6f4"
+        )
         print("Settings added to plot", flush=True)
 
     def remove_settings(self):
         # remove significant settings from the plot:
-        self._ax.legend().remove()
+        leg = self._ax.get_legend()
+        if leg is not None:
+            leg.remove()
         for j in range(len(self._setrefs)):
             # 3 steps are used to properly remove all references to the plotted objects
             ref = self._setrefs.pop(0)
@@ -1348,10 +1434,11 @@ class Monitor(Sender):
         self.reset_background()
 
     def plot_lines(self):
-        # plots the data lines
-        for l, d in zip(self._lines, self.data.values()):
-            l.set_data(d[0], d[1])
-            self._bm.update()
+        # plots the data lines — self._lines[0] is cavity, [1] is trigger (if enabled)
+        self._lines[0].set_data(self.data["Cavity"][0], self.data["Cavity"][1])
+        if self._show_trigger and len(self._lines) > 1 and "Trigger" in self.data:
+            self._lines[1].set_data(self.data["Trigger"][0], self.data["Trigger"][1])
+        self._bm.update()
 
     def update_monitor(self):
         """
