@@ -1,3 +1,32 @@
+Git Commands:
+    # 1. Create and switch to new branch (changes carry over automatically)
+    git checkout -b new-branch-name
+
+    # 2. Now stage and commit
+    git add .
+    git commit -m "your message"
+
+    # 3. Push
+    git push -u origin new-branch-name
+
+    # 4. Check repo origin
+    git remote -v
+
+    # 5. Fetch all new branches and commits
+    git fetch origin
+
+    # 6. Up-to-date local branch
+    git pull origin main-stcl
+
+    # 7. Check all branches
+    git branch -a | findstr origin
+
+    # 8. Pull latest files from GitHUb
+    git status (come to the brnach you want to sync)
+    git pull origin <branch name>
+
+
+
 Commands:
 1. systemctl restart redpitaya_nginx
 2. ss -tlnp | grep -E "5000|5065"
