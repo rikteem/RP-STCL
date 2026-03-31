@@ -1,3 +1,29 @@
+Commands:
+1. systemctl restart redpitaya_nginx
+2. ss -tlnp | grep -E "5000|5065"
+3. pkill -f RunLock.py
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+Switch between Projects:
+
+//Switch to STCL project:
+
+systemctl stop rp_server
+systemctl disable rp_server
+PYTHONPATH=/opt/redpitaya/lib/python/:$PYTHONPATH python3 /root/RunLock.py
+
+//Switch to Oscilloscope project:
+
+# first kill RunLock if it's running
+pkill -f RunLock.py
+systemctl enable rp_server
+systemctl start rp_server
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+..........................................................................................................................................
 Issue 1: If ssh to board shows connection error with Port 22. And apt -a shows some other unknown ip addr blocking your board's ip
 
 Note: You might not be able to connect multiple laptops at same time as it works
@@ -59,7 +85,7 @@ then do this:
     a. Check if you have put an addr out of 0-255 range
     b. Check if your laptop's IP in 192.168.0.x not anything else by CMD->ipconfig
 
-
+.........................................................................................................................................
     Issue 2: If Scan signal at oscilloscope dies all of a sudden/stop_loop hangs
 
     go to cmd
@@ -70,12 +96,14 @@ then do this:
 
     then restart kernel and re-run cells.
 
+........................................................................................................................................
     Issue 3: If you want to check what's happening on the port do this:
 
     1. ssh to board
     2. "PYTHONPATH=/opt/redpitaya/lib/python/:$PYTHONPATH python3 /root/RunLock.py"
     the logs will appear.
 
+..........................................................................................................................................
     Issue 4: If Calibration Page doesn't open then (The EEPROM calibration data on this board is corrupt/empty for the new OS format. OS 2.07-48 uses a new universal calibration format that your board's EEPROM doesn't have — so rp_Init() gets zero gains, hits divide-by-zero, and kills the nginx worker instantly.):
     1. Update OS from browser in Settings.
     2. Use this prompt in Claude to run diagnostics and find failure:
@@ -90,4 +118,4 @@ then do this:
 
     # Verify calibration is now valid
     /opt/redpitaya/bin/calib -r 2>&1 | head -5
-    4. 
+    

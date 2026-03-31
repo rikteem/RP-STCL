@@ -326,11 +326,16 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
         Receiver.__init__(
             self, (host, port)
         )  # initialize the receiver which handles the event_loop
+        # "scan_mon" is a PC-side concept — the board runs in plain "scan" mode.
+        # "monitor" maps RP_mode → "lock" for server-side action routing.
+        _board_mode = "scan" if RP_mode == "scan_mon" else RP_mode
         if RP_mode == "monitor":
             self.RP_mode = "lock"
+        elif RP_mode == "scan_mon":
+            self.RP_mode = "scan"
         else:
             self.RP_mode = RP_mode
-        self.lock = RP_Lock((host, port2), mode=RP_mode)
+        self.lock = RP_Lock((host, port2), mode=_board_mode)
         self.action_dict = {
             "acquire": self.action_acquire,
             "acquire_ch": self.action_acquire_ch,
@@ -436,25 +441,99 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
                                      amplitude=amplitude,
                                      offset=offset)
 
-        # Step 2 — bare reaction_loop (identical structure to action_monitor)
+        # Step 2 — reaction_loop on port 5065, with acquire_ch cache so the
+        # PC-side Monitor process can request data while the scan runs.
         addr = (self.addr[0], 5065)
         rl = reaction_loop(addr)
         rl.var_dict["i"] = 0
 
+        # Cache for both channels — populated each iteration, served to the
+        # PC-side Monitor process via cached_acquire_ch without re-triggering.
+        rl.var_dict["ch_cache"] = {0: None, 1: None}
+
+        # Shared cache written by iteration(), read by monitor server
+        import threading as _thr
+        _cache_lock = _thr.Lock()
+        _cache = {0: None, 1: None}
+        _mon_stop = _thr.Event()   # cleared = running, set = stop
+
+        def _monitor_server():
+            """
+            Dedicated monitor server on port 5066.
+            Accepts a connection, reads channel number (1 byte),
+            sends [duration, data_list] as JSON, closes connection.
+            """
+            import socket as _sock, json as _json, struct as _struct
+            srv = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            srv.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+            srv.bind((self.addr[0], 5066))
+            srv.listen(5)
+            srv.settimeout(0.2)
+            while not _mon_stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except _sock.timeout:
+                    continue
+                try:
+                    conn.settimeout(1.0)
+                    ch_byte = conn.recv(1)
+                    ch = ch_byte[0] if ch_byte else 0
+                    with _cache_lock:
+                        data = _cache.get(ch)
+                        dur  = self.lock.times[-1]
+                    if data is not None:
+                        payload = _json.dumps([dur, data.tolist()]).encode("utf-8")
+                    else:
+                        payload = _json.dumps([0.0, []]).encode("utf-8")
+                    # Simple framing: 4-byte length + payload
+                    conn.sendall(_struct.pack(">I", len(payload)) + payload)
+                except Exception:
+                    pass
+                finally:
+                    try: conn.close()
+                    except Exception: pass
+            try: srv.close()
+            except Exception: pass
+
+        _mon_stop.clear()   # ensure not stopped before thread starts
+        _mon_srv_thread = _thr.Thread(target=_monitor_server, daemon=True)
+        _mon_srv_thread.start()
+
         def iteration():
-            self.lock.acquire_ch(0)
+            # Acquire both channels each cycle and store in shared cache.
+            self.lock.trigger()
+            import rp as _rp
+            _ret, trig_pos = _rp.rp_AcqGetWritePointerAtTrig()
+            import numpy as _np
+            arr0 = _np.zeros(self.lock.N, dtype=_np.float32)
+            arr1 = _np.zeros(self.lock.N, dtype=_np.float32)
+            _rp.rp_AcqGetDataVNP(_rp.RP_CH_1, trig_pos, arr0)
+            _rp.rp_AcqGetDataVNP(_rp.RP_CH_2, trig_pos, arr1)
+            with _cache_lock:
+                _cache[0] = arr0
+                _cache[1] = arr1
+            rl.var_dict["ch_cache"][0] = arr0
+            rl.var_dict["ch_cache"][1] = arr1
+            self.lock.acquisition = arr0
+            self.lock._adc_cache = {0: arr0, 1: arr1}
             rl.var_dict["i"] += 1
+
+        def cached_acquire_ch(query):
+            """Serve cached channel data to the Monitor process on port 5065."""
+            ch = int(query)
+            cached = rl.var_dict["ch_cache"].get(ch)
+            if cached is None:
+                # Cache not yet populated — fall back to a live acquire
+                cached = self.lock.acquire_ch(ch)
+            duration = self.lock.times[-1]
+            return [duration, cached.tolist()]
 
         def rl_update_settings(settings):
             self.lock.update_settings(settings)
             return "settings updated"
 
         def rl_set_scan_output(query):
-            """Handle set_scan_output on port 5065 (the loop socket).
-            Without this entry in rl.action_dict the command arrives but gets
-            no handler, so libserver never sends a response and the PC-side
-            send() blocks forever — causing the >1 min hang.
-            """
+            """Handle set_scan_output on port 5065 (the loop socket)."""
             if not isinstance(query, dict):
                 return "set_scan_output: query must be a dict"
             if "period_ms" in query:
@@ -466,9 +545,10 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
             return "scan output updated"
 
         rl.iteration = iteration
+        rl.action_dict["acquire_ch"]      = cached_acquire_ch   # for Monitor process
         rl.action_dict["update_settings"] = rl_update_settings
         rl.action_dict["set_dec"]         = self.action_set_dec
-        rl.action_dict["set_scan_output"] = rl_set_scan_output  # fixes hang
+        rl.action_dict["set_scan_output"] = rl_set_scan_output
 
         print("action_start_scan: loop starting on port 5065")
         rl.start_loop()   # blocks until "stop" received on port 5065
@@ -476,6 +556,7 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
         # Step 5 — clean up after loop exits
         print("action_start_scan: {} iterations done, disabling Out2".format(
             rl.var_dict["i"]))
+        _mon_stop.set()   # stop monitor server thread cleanly
         self.lock.gen_ramp.offset = 0.0
         self.lock.scan_output_disable()
         return "Done"
@@ -529,10 +610,16 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
 
     def action_acquire_ch(self, query):  # this is used to monitor the cavity signal
         ch = int(query)
-        data = self.lock.acquire_ch(ch)
-        duration = self.lock.times[
-            -1
-        ]  # instead of the full time trace, just give the last time value! the first one is always 0 and the number of data points is always the same
+        # Serve from ADC cache if available (populated by the scan loop
+        # iteration() in action_start_scan / action_monitor). This avoids
+        # calling trigger() on port 5000 which would conflict with the scan
+        # loop already owning the ADC on port 5065.
+        cache = getattr(self.lock, "_adc_cache", None)
+        if cache is not None and cache.get(ch) is not None:
+            data = cache[ch]
+        else:
+            data = self.lock.acquire_ch(ch)
+        duration = self.lock.times[-1]
         return [duration, data.tolist()]
 
     def action_acquire_ch_n(self, query):
@@ -635,13 +722,41 @@ class RP_Server(Receiver):  # handles socket communication from redpitaya side
             print("updated settings: {}".format(rl.var_dict["settings"]))
             return "updated settings!"
 
+        # Cache for both channels — populated each iteration, served to PC
+        # via action_acquire_ch without re-triggering the ADC.
+        rl.var_dict["ch_cache"] = {0: None, 1: None}
+
         def iteration():
-            self.lock.acquire_ch(0)
+            # Acquire both channels in one trigger cycle so that PC-side
+            # acquire_ch calls for ch0 AND ch1 are served from the same
+            # triggered buffer — no extra trigger() call per channel.
+            self.lock.trigger()
+            import rp as _rp
+            _ret, trig_pos = _rp.rp_AcqGetWritePointerAtTrig()
+            import numpy as _np
+            arr0 = _np.zeros(self.lock.N, dtype=_np.float32)
+            arr1 = _np.zeros(self.lock.N, dtype=_np.float32)
+            _rp.rp_AcqGetDataVNP(_rp.RP_CH_1, trig_pos, arr0)
+            _rp.rp_AcqGetDataVNP(_rp.RP_CH_2, trig_pos, arr1)
+            rl.var_dict["ch_cache"][0] = arr0
+            rl.var_dict["ch_cache"][1] = arr1
+            self.lock.acquisition = arr0   # keep .acquisition consistent (IN1)
             rl.var_dict["i"] += 1
+
+        # Override action_acquire_ch to serve from cache (no extra trigger)
+        def cached_acquire_ch(query):
+            ch = int(query)
+            cached = rl.var_dict["ch_cache"].get(ch)
+            if cached is None:
+                # Cache not yet populated — fall back to live acquire
+                cached = self.lock.acquire_ch(ch)
+            duration = self.lock.times[-1]
+            return [duration, cached.tolist()]
 
         rl.action_dict["give"] = give
         rl.action_dict["update_settings"] = update_settings
         rl.action_dict["set_dec"] = self.action_set_dec
+        rl.action_dict["acquire_ch"] = cached_acquire_ch
         rl.iteration = iteration
         rl.start_loop()
         t = perf_counter() - t0
@@ -1022,7 +1137,7 @@ class RP:
         self.times = np.linspace(0, dur - (8e-9 * dec), self.N) * 1e3
         self._dec = dec
         print("set_dec: dec={}  period={:.3f} ms  freq={:.1f} Hz".format(
-            dec, dur * 1e3, self._scan_freq_hz(dec) if self.mode == "scan" else 0))
+            dec, dur * 1e3, self._scan_freq_hz(dec)))
 
     def trigger(self, max_polls=200000):
         """

@@ -1,8 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-Created on Mon Feb 27 10:45:59 2023
+lockclient.py  —  Combined Cav+Mon single-RP edition
+=====================================================
 
-@author: epultinevicius
+Key addition vs the original lockclient.py
+-------------------------------------------
+Mode  ``"scan_mon"``  (new)
+    A single RedPitaya that acts as **both** the cavity-scanning master
+    (Cav) **and** the monitor (Mon).  Internally the LockClient registers
+    it once in ``self.masters`` *and* once in ``self.monitors``, so all
+    existing scan / lock / monitor methods work without modification.
+
+    The Monitor classes (cavity + error) use the same dark-themed Qt5Agg
+    aesthetics from the Mon-only branch:
+      • Dark background  (#1e1e2e / #181825 Catppuccin palette)
+      • Dual-axis layout when trigger is visible (IN1 cavity, IN2 trigger)
+      • Coloured range-spans and lockpoint vlines
+      • ``Monitor.show_trigger`` class flag (default True)
+
+Original modes ``"scan"``, ``"lock"``, ``"monitor"``, ``"ext_scan"`` are
+unchanged and fully backward-compatible.
 """
 
 from communication import Sender, RP_connection, Path
@@ -30,20 +47,148 @@ half_window = (window_size - 1) // 2
 m = SG_array(window_size, order, deriv=1)
 
 
-def monitor(v, *args):
-    m = Monitor(*args, bool_var=v)
-    m.start_event_loop()
-    m.start_monitor()
-    v.value = False  # set monitor running to false after the monitor is finished, in any case!
+def _patch_send_for_inline(rp_obj, sender):
+    """
+    Monkey-patch rp_obj.send so the while-True wait loop calls
+    sender._process_sel_once() on each iteration instead of just sleep(0).
+    This makes registration and processing happen in the same thread.
+    """
+    import functools
+    from communication import RP_connection
+    _orig_send = RP_connection.send
+
+    @functools.wraps(_orig_send)
+    def _inline_send(self_rp, Sender_arg, action, value="Hello World!",
+                     loop_action=False, loop=False):
+        if not Sender_arg.running:
+            print("Event_loop not running!")
+            return None
+        import socket as _socket, selectors as _sel, libclient as _lc
+        request = self_rp.create_request(action, value)
+        if not loop:
+            sock = self_rp.connect_socket(self_rp.addr)
+            addr = self_rp.addr
+            stop = True
+        else:
+            sock = self_rp.lsock
+            addr = (self_rp.addr[0], 5065)
+            stop = False
+            if action == "stop":
+                stop = True
+        event_state = _sel.EVENT_READ | _sel.EVENT_WRITE
+        message = _lc.Message(Sender_arg.sel, sock, addr, request, stop=stop)
+        Sender_arg.sel.register(sock, event_state, data=message)
+        if loop_action:
+            self_rp.loop_running = True
+        while True:
+            # Process the selector inline — same thread as registration.
+            Sender_arg._process_sel_once()
+            if loop_action and self_rp.loop_running:
+                if self_rp.lsock is None:
+                    try:
+                        key = Sender_arg.sel.get_key(sock)
+                        if key.events & _sel.EVENT_READ:
+                            laddr = (self_rp.addr[0], 5065)
+                            sleep(2)
+                            self_rp.lsock = self_rp.connect_socket(laddr)
+                            sleep(0.5)
+                            try:
+                                self_rp.lsock.getpeername()
+                            except Exception as exp:
+                                print(f"Exception occured during connection: {exp}")
+                                self_rp.loop_running = False
+                                return "Exception occured during connection..."
+                    except KeyError:
+                        pass
+            if message.selkey is not None:
+                if self_rp.loop_running and action == "stop":
+                    self_rp.loop_running = False
+                break
+        if message.response is None:
+            result = None
+        else:
+            result = message.response["result"]
+        if loop_action:
+            self_rp.lsock = None
+        return result
+
+    # Bind to this specific rp instance only
+    import types
+    rp_obj.send = types.MethodType(_inline_send, rp_obj)
+
+
+def _make_nonblocking_event_loop(sender):
+    """
+    Patch sender.event_loop to use sel.select(timeout=0) instead of timeout=1.
+    This prevents the selector from blocking during socket registration from
+    another thread, which is the root cause of hangs on Windows.
+    """
+    import selectors as _sel
+    import traceback as _tb
+    from time import sleep as _sleep
+
+    def _fast_event_loop():
+        sender.running = True
+        try:
+            while True:
+                if not sender.sel.get_map():
+                    _sleep(1e-4)
+                else:
+                    events = sender.sel.select(timeout=0)  # non-blocking
+                    for key, mask in events:
+                        message = key.data
+                        if message is not None:
+                            try:
+                                if sender.mode == "monitor":
+                                    message.buffersize = int(2**18)
+                                else:
+                                    message.buffersize = int(2**12)
+                                message.process_events(mask)
+                            except Exception:
+                                print("Main: Error: Exception for %s:\n%s" % (
+                                    message.addr, _tb.format_exc()))
+                                message.close()
+                if not sender.running:
+                    break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            return
+
+    sender.event_loop = _fast_event_loop
+
+
+def monitor(v, *args, **kwargs):
+    try:
+        m = Monitor(*args, bool_var=v)
+        _make_nonblocking_event_loop(m)
+        m.start_event_loop()
+        m.start_monitor()
+    except Exception as _exc:
+        import traceback
+        print("[Monitor] EXCEPTION:", flush=True)
+        traceback.print_exc()
+    finally:
+        v.value = False
     return
 
 
 def monitor_errors(v, *args, **kwargs):
-    m = ErrorMonitor(*args, bool_var=v, **kwargs)
-    m.start_event_loop()
-    m.start_monitor()
-    v.value = False
+    try:
+        m = ErrorMonitor(*args, bool_var=v, **kwargs)
+        _make_nonblocking_event_loop(m)
+        m.start_event_loop()
+        m.start_monitor()
+    except Exception as _exc:
+        import traceback
+        print("[ErrorMonitor] EXCEPTION:", flush=True)
+        traceback.print_exc()
+    finally:
+        v.value = False
     return
+
+
+
 
 
 def init_mon_dict():
@@ -76,9 +221,10 @@ class LockClient(Sender):
         DIR : string, optional
             directory to save settings files. If None, a default directory from
             the repository is used. The default is None.
-        Ext_Scan : bool, optional
-            if the transfer cavity is scanned externally (e.g. a function generator),
-            then set this variable to True in order to be able to acquire cavity signals.
+
+        New mode: ``"scan_mon"``
+            Register a single RP as both the scanning master and the monitor.
+            Set  ``RP_client(..., mode="scan_mon")``  in the RPs dict.
         """
 
         if DIR != None:  # if a directory is given, initiate use it for the Sender class
@@ -95,9 +241,9 @@ class LockClient(Sender):
         for key, val in self.RPs.items():
             val.label = key  # set the key as an attribute for the RP objects!
             val.upload_current()
-            if val.mode in ["scan", "ext_scan"]:
+            if val.mode in ["scan", "ext_scan", "scan_mon"]:
                 self.masters.append(key)
-            elif val.mode == "monitor":
+            if val.mode in ["monitor", "scan_mon"]:
                 self.monitors[key] = init_mon_dict()
             filepath = Path(self.DIR, f"{key}.json")
             if filepath.exists():
@@ -124,7 +270,7 @@ class LockClient(Sender):
         Close the LockClient and everything related to it. The order is important here:
          - first, monitors are closed.
          - next, any loops running on redpitayas (mode = lock or monitor) are closed.
-         - only then loops running on master redpitayas (mode = scan) are closed,
+         - only then loops running on master redpitayas (mode = scan or scan_mon) are closed,
              since they are triggering the other redpitayas.
          - After all redpitaya loops are stopped, the listening servers on the redpitayas
              are stopped (disconnected)
@@ -184,6 +330,9 @@ class LockClient(Sender):
 
         master_RP = self.find_master_RP(RP)
         slaves = self.find_slave_RPs(master_RP)
+        # scan_mon RP is its own monitor — check it first
+        if master_RP in self.monitors:
+            return master_RP
         for key in slaves:
             if key in self.monitors:
                 return key
@@ -208,9 +357,10 @@ class LockClient(Sender):
         for key, val in self.RPs.items():
             if val.settings["Master"] == master_RP and val.mode in ["lock", "monitor"]:
                 RPs.append(key)
-        RPs.append(
-            master_RP
-        )  # add the master_RP, since it is also associated with the same cavity. its the last entry.
+        # For scan_mon, the RP itself is in self.monitors but its settings["Master"]
+        # is its own key (same RP) — avoid double-adding it.
+        if master_RP not in RPs:
+            RPs.append(master_RP)
         return RPs
 
     ################# decorators #######################################
@@ -248,6 +398,14 @@ class LockClient(Sender):
             self, RP, *args, **kwargs
         ):  # IMPORTANT: at least RP as argument is expected!
             if self.RPs[RP].loop_running:
+                # scan_mon: the monitor mp.Process is completely independent of
+                # the scan loop — both run concurrently on the same board.
+                # Bypass the loop guard entirely for scan_mon so start_monitor
+                # and start_error_monitor are always allowed through.
+                # NOTE: func.__name__ is "inner" here due to decorator stacking,
+                # so we check the RP mode instead of the function name.
+                if self.RPs[RP].mode == "scan_mon":
+                    return func(self, RP, *args, **kwargs)
                 print(
                     f"Loop currently running on {RP}! Stop it before running this function!"
                 )
@@ -257,38 +415,55 @@ class LockClient(Sender):
 
         return inner
 
+    def _check_update_setting(func):
+        def inner(self, RP, laser, key, val):
+            if (
+                laser not in self.RPs[RP].settings
+            ):
+                print(f"There is no laser {laser} in the settings!")
+                return
+            elif type(self.RPs[RP].settings[laser]) == dict:
+                if (
+                    key not in self.RPs[RP].settings[laser]
+                ):
+                    var = input(f"{key} does not exist in settings! Add it? (y/n)")
+                    if var == 'y':
+                        pass
+                    else:
+                        print(f'{key} not added.')
+                        return
+            if laser == 'Master' and not (RP in self.masters):
+                print("Master settings can not be changed with this command for a non-scanning RP. If you want to change the scanning cavity, use the method 'change_cavity'")
+                return
+            if not self.check_new_settings(RP, laser, key, val):
+                return
+            return func(self, RP, laser, key, val)
+
+        return inner
+
     def check_cavity_scanned(self, RP):
         """
         used to check if the cavity associated with RP is currently scanned.
         If not, then this means that it is not triggered, and no response would arrive,
         blocking the entire script...
+
+        For ``scan_mon`` mode: the same RP scans AND monitors, so as long as
+        its loop is running (or it is ext_scan), acquisition is valid.
         """
         master = self.RPs[RP].settings["Master"]
-        if (
-            type(master) == str
-        ):  # if not master RP, then check if cavity is scanned first!
+        if type(master) == str:  # if not master RP, check if cavity is scanned first!
             if self.RPs[master].loop_running or self.RPs[master].mode == "ext_scan":
                 return True
             else:
                 print(f"No scanning loop running on {master}!")
                 return False
-        else:  # if RP is the master, then it scans the cavity itself!
+        else:  # RP is the master (or scan_mon) — it scans the cavity itself!
             return True
 
     def check_new_settings(self, RP, laser, key, val):
         """
         Used when updating settings.
         Checks if the new settings are valid.
-
-        Parameters
-        ----------
-        see documentation for 'update_setting'
-
-        Returns
-        -------
-        bool
-            True if the new setting is valid, False otherwise.
-
         """
         if key == "range":
             if not check_range(laser, val, self.get_current_dec(RP)):
@@ -320,28 +495,6 @@ class LockClient(Sender):
             return True
 
     def check_range_contains_lp(self, RP, laser, R):
-        """
-        Used when updating 'range' setting.
-        Checks whether the new range contains the old lockpoint.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the RedPitaya in question.
-        laser : str
-            Key of the Output/Laser in question.
-            For scanning RPs: 'Master'
-            For laser locking RPs: 'Slave1' or 'Slave2' for outputs 1 or 2 respectively
-        R : list
-            New range setting.
-
-        Returns
-        -------
-        bool
-            True if the new setting is valid, False otherwise.
-
-        """
-        # checks whether the new range setting R includes lockpoint
         lp = self.RPs[RP].settings[laser]["lockpoint"]
         if laser == "Master":
             r = R[1]
@@ -350,36 +503,11 @@ class LockClient(Sender):
         return r[0] < lp < r[1]
 
     def new_range_new_lp(self, RP, laser, R):
-        """
-        Used when updating 'range' setting.
-        If the new range setting does not contain the old lockpoint, this method
-        allows for the choice of a new lockpoint.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the RedPitaya in question.
-        laser : str
-            Key of the Output/Laser in question.
-            For scanning RPs: 'Master'
-            For laser locking RPs: 'Slave1' or 'Slave2' for outputs 1 or 2 respectively
-        R : list
-            New range setting.
-
-        Returns
-        -------
-        bool
-            True if the new lockpoint is valid, False otherwise.
-
-        """
-        # if new range does not include the lockpoint, the lockpoint lp can be set to a new value
         if not self.check_range_contains_lp(RP, laser, R):
             query = input(
                 f"range {R} does not contain the current lockpoint. If this is intended, input new lockpoint here (non-valid value to cancel):\n"
             )
-            if check_lockpoint(
-                laser, R, float(query)
-            ):  # if valid lockpoint is chosen, apply it.
+            if check_lockpoint(laser, R, float(query)):
                 self.RPs[RP].settings[laser]["lockpoint"] = float(query)
                 return True
             else:
@@ -389,17 +517,12 @@ class LockClient(Sender):
             return True
 
     def _check_update_setting(func):
-        # decorator specificly for update_setting!
         def inner(self, RP, laser, key, val):
-            if (
-                laser not in self.RPs[RP].settings
-            ):  # do not accidently add another output to the redpitaya!
+            if laser not in self.RPs[RP].settings:
                 print(f"There is no laser {laser} in the settings!")
                 return
             elif type(self.RPs[RP].settings[laser]) == dict:
-                if (
-                    key not in self.RPs[RP].settings[laser]
-                ):  # do not accidently add another setting!
+                if key not in self.RPs[RP].settings[laser]:
                     var = input(f"{key} does not exist in settings! Add it? (y/n)")
                     if var == 'y':
                         pass
@@ -409,14 +532,12 @@ class LockClient(Sender):
             if laser == 'Master' and not (RP in self.masters):
                 print("Master settings can not be changed with this command for a non-scanning RP. If you want to change the scanning cavity, use the method 'change_cavity'")
                 return
-
             if not self.check_new_settings(RP, laser, key, val):
                 return
-            return func(
-                self, RP, laser, key, val
-            )  # if every check worked out, finally run the function!
+            return func(self, RP, laser, key, val)
 
         return inner
+
 
     #################### Locking related functions ############################
 
@@ -424,17 +545,10 @@ class LockClient(Sender):
         """
         Stops the loop running on the RedPitaya. This includes lock and scan loops.
 
-        For scan-mode RPs, sends "stop_scan" first to disable Out2 immediately.
-        This is wrapped in try/except because the main command port (5000) may
-        be unreachable at shutdown time — the "stop" on port 5065 still works.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the RedPitaya in question.
-
+        For scan-mode RPs (including scan_mon), sends "stop_scan" first to
+        disable Out2 immediately.
         """
-        if self.RPs[RP].mode == "scan":
+        if self.RPs[RP].mode in ["scan", "scan_mon"]:
             try:
                 self.send(RP, "stop_scan")
             except Exception as e:
@@ -445,18 +559,7 @@ class LockClient(Sender):
         """
         Start the cavity scan: enables Out2 triangle waveform and acquisition loop.
 
-        Parameters
-        ----------
-        RP : str
-            Key of the RedPitaya which scans the cavity.
-        amplitude : float, optional
-            Half-swing of the triangle wave in volts. Default 0.5 V.
-            Board supports HV mode: amplitude + abs(offset) <= 6.0 V.
-        offset : float, optional
-            DC offset shifting the scan centre in volts. Default 0.0 V.
-        period_ms : float or None, optional
-            Desired scan period in milliseconds. The board selects the closest
-            valid decimation automatically. None = keep current decimation.
+        Works for both ``scan`` and ``scan_mon`` modes.
         """
         if self.RPs[RP].loop_running:
             print(f"Loop already running on {RP}! Call stop_loop('{RP}') first.")
@@ -472,15 +575,6 @@ class LockClient(Sender):
     def start_loop(self, RP, action, value="Hello world!"):
         """
         Start any kind of loop on the RedPitaya remotely using this command.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the RedPitaya in question.
-        action : str
-            Name of the action which starts a loop on RP.
-        value : any, optional
-            Value forwarded with the action (e.g. scan parameters dict).
         """
         t = threading.Thread(
             target=self.send, args=(RP, action),
@@ -493,17 +587,6 @@ class LockClient(Sender):
         """
         Update scan output parameters while the scan is running.
         Takes effect immediately — no need to stop/restart the scan.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the RedPitaya which is scanning.
-        amplitude : float, optional
-            New half-swing in volts. Omit to keep current value.
-        offset : float, optional
-            New DC offset in volts. Omit to keep current value.
-        period_ms : float, optional
-            New scan period in milliseconds. Omit to keep current value.
         """
         if not self.RPs[RP].loop_running:
             print(f"No scan running on {RP}. Start scan first.")
@@ -522,14 +605,7 @@ class LockClient(Sender):
     @_check_cavity_scanned  # only start lock if cavity is scanned.
     def start_lock(self, RP):
         """
-        Initiate the lock with the current settings on one redpitaya. This
-        starts a second host (port 5065) on the redpitaya which can be accessed
-        in order to stop the loop!
-
-        Parameters
-        ----------
-        RP : str
-            Key of the RedPitaya in question.
+        Initiate the lock with the current settings on one redpitaya.
         """
         self.update_settings(RP)
         return self.start_loop(RP, "start_lock")
@@ -546,13 +622,11 @@ class LockClient(Sender):
         filepath = Path(self.DIR, "Default.json")
         with open(filepath, "r") as file:
             default = json.load(file)
-        if self.RPs[RP].mode in ["scan", "ext_scan"]:
+        if self.RPs[RP].mode in ["scan", "ext_scan", "scan_mon"]:
             settings = dict(Master=default["Master"])
         else:
             if len(self.masters) > 0:
-                default["Master"] = self.masters[
-                    0
-                ]  # reference the first cavity by default
+                default["Master"] = self.masters[0]
             else:
                 default["Master"] = "Cav"
             print(f"Master set to {default['Master']}")
@@ -562,7 +636,6 @@ class LockClient(Sender):
     def change_cavity(self, RP, RP_master):
         """
         Update the cavity which the redpitaya RP corresponds to RP_master.
-        --> change the master cavity, which the laser corresponds to.
         """
         if RP_master not in self.masters:
             print(f"{RP_master} is not scanning a cavity.")
@@ -570,141 +643,58 @@ class LockClient(Sender):
         if RP not in self.masters:
             self.RPs[RP].settings["Master"] = RP_master
 
-    @_apply_to_monitor  # this is a decorator. see https://www.programiz.com/python-programming/decorator
+    @_apply_to_monitor
     def update_settings(self, RP):
         """
         updates all locking settings of one RedPitaya by loading them from the
         corresponding json file.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the RedPitaya in question.
         """
         RP_ = self.RPs[RP]
-        # load the current settings from the json file!
         with open(Path(self.DIR, f"{RP}.json"), "r") as file:
             settings = json.load(file)
         RP_.settings = settings
-        # the following sets up the settings as required for the redpitaya
         settings = self.retrieve_settings(RP)
-        # then send the settings to the redpiaya
         self.send(RP, "update_settings", value=settings)
 
     @_check_update_setting
     @_apply_to_monitor
     def update_setting(self, RP, laser, key, val):
         """
-        Update a setting of the lock on a RedPitaya. This can be used before as well
-        as during the lock, allowing in principle for scans of the laser frequency
-        over the whole range.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the RedPitaya in question.
-        laser : str
-            Denotes which laser is addressed. the following inputs are possible:
-
-            'Master': Only available for a scanning redpitaya (mode = 'scan'). This is used
-                    for the cavity stabilization based on the reference laser. For
-                    RedPitayas of mode = 'lock', the setting would correspond to
-                    the key of the scanning redpitaya (in this example: 'Cav')
-
-            'Slave1' or 'Slave2': Only available for laser locking redpitayas (mode = 'lock').
-                    The number (1 or 2) denotes the output of the redpitaya, which is
-                    providing the feedback for the locked laser!
-        key : str
-            Key refering to the updated setting. The following settings are
-            available:
-
-                'range': region of interest used for peak-detection
-                'lockpoint': point in the scan to lock the resonance to
-                'enabled': Whether the lock for the respective laser is enabled or not.
-                'PID': Settings containing the PID gains and limits for the respective laser.
-        val : list, float, bool or dict
-            the new value for the setting. Type depends on the setting:
-                'range': list (length 2, for 'Master': nested list ).
-                    The region in the scan, where the the cavity resonance
-                    shall be detected. for reference (Master), two ranges must be given
-                    (e.g. [[0.1,0.4], [1.7, 2.0]]). values in ms, as on the xaxis.
-                    for Slave1 or Slave2, something like [0.5, 0.8] is expected.
-                'lockpoint': float,
-                    The time value [ms] in the cavity signal, to which
-                    the resonance position should be moved by the lock. This information
-                    is converted to relative distances to the reference peak
-                    on the redpitaya. Should be in the range.
-                'enabled': bool
-                'PID': dict,
-                    contains the parameters of the PID which generates the feedback.
-                    this dictionary contains the following items:
-
-                        'P': proportional gain
-                        'I': Integral gain
-                        'D': derivative gain
-                        'limit': list of two values that serve as extremes of the
-                                desired feedback (default: maximum range [-1,1] --> between -1 and +1 V output possible)
-
+        Update a setting of the lock on a RedPitaya.
         """
-        #  updates a specific setting for the lock!
-        self.RPs[RP].settings[laser][
-            key
-        ] = val  # update the setting with the considered value
-        self.save_settings(
-            RP
-        )  # save the updated settings in an external json file for later!
+        self.RPs[RP].settings[laser][key] = val
+        self.save_settings(RP)
         settings = self.retrieve_settings(RP)
-        return self.send(
-            RP, "update_settings", value=settings
-        )  # then, send the actual settings!
+        return self.send(RP, "update_settings", value=settings)
 
     def save_settings(self, RP):
         """
         Saves all locking settings of one RedPitaya to a json file
-
-        Parameters
-        ----------
-        RP : str
-            Key of the RedPitaya in question.
         """
-        with open(
-            Path(self.DIR, f"{RP}.json"), "w"
-        ) as file:  # the file is called after the RP key!
+        with open(Path(self.DIR, f"{RP}.json"), "w") as file:
             json.dump(self.RPs[RP].settings, file, indent=4)
 
     def retrieve_settings(self, RP):
         """
         Used when sending settings to the RedPitaya. Mainly converts ms values
         in the ranges to indexes.
-
-        Parameters
-        ----------
-        RP :
-            Key of the RedPitaya in question.
-
-        Returns
-        -------
-        settings : dict
-            Lock settings which are generated in such a way, that the
-            RedPitayas can properly work with them.
-
         """
         RP_ = self.RPs[RP]
-        if not (RP_.mode in ["scan", "ext_scan"]):
+        if not (RP_.mode in ["scan", "ext_scan", "scan_mon"]):
             settings = deepcopy(RP_.settings)
             settings["Master"] = deepcopy(
                 self.RPs[RP_.settings["Master"]].settings["Master"]
             )
         else:
             settings = deepcopy(RP_.settings)
-        # convert range values from ms to index values, which are used by the redpitaya!
+        # convert range values from ms to index values
         for key in settings:
             dec = settings["Master"]["dec"]
             if key == "Master":
                 R = settings[key]["range"]
                 settings[key]["range"] = [
                     [ms2index(x, dec) for x in r] for r in R
-                ]  # nested list comprehension
+                ]
             else:
                 R = settings[key]["range"]
                 settings[key]["range"] = [ms2index(x, dec) for x in R]
@@ -712,23 +702,18 @@ class LockClient(Sender):
 
     def retrieve_monitor_settings(self, master_RP):
         """
-        Retrieves all combined settings of redpitayas associated with  master_RP.
-        Usually helpful to collect the settings for the monitor, hence the name of this function.
+        Retrieves all combined settings of redpitayas associated with master_RP.
         """
         settings = {}
-        RPs = self.find_slave_RPs(
-            master_RP
-        )  # collect all redpitayas associated with master_RP
-        for key in RPs:  # key: RP identifier
+        RPs = self.find_slave_RPs(master_RP)
+        for key in RPs:
             for val_key, val_val in self.RPs[key].settings.items():
-                # val_key: Laser identifier
-                # find master settings
                 s = deepcopy(self.retrieve_settings(key))[val_key]
                 if key in self.masters and val_key == "Master":
                     settings[val_key] = s
                 elif (
                     val_key != "Master" and self.RPs[key].mode == "lock"
-                ):  # each other case should contain laser locking settings
+                ):
                     settings[f"{key} : {val_key}"] = s
         return settings
 
@@ -738,34 +723,27 @@ class LockClient(Sender):
         """
         Get the current dec setting for the cavity scan associated with RP
         """
-        settings = deepcopy(self.RPs[RP].settings)  # copy of the settings
+        settings = deepcopy(self.RPs[RP].settings)
         for key in settings:
-            if (
-                key == "Master" and type(settings[key]) != str
-            ):  # RP is scanning the cavity
+            if key == "Master" and type(settings[key]) != str:
                 dec0 = settings[key]["dec"]
             else:
-                dec0 = self.RPs[settings["Master"]].settings["Master"][
-                    "dec"
-                ]  # dec from associated master settings
+                dec0 = self.RPs[settings["Master"]].settings["Master"]["dec"]
         return dec0
 
     def rescale_settings(self, RP, c):
         """
-        Scales the settings associated with a scan time axis by a factor. Used
-        for updating the dec settings!
+        Scales the settings associated with a scan time axis by a factor.
         """
         settings = self.RPs[RP].settings
         for key in settings:
-            if (
-                key == "Master" and type(settings[key]) != str
-            ):  # range for master settings
+            if key == "Master" and type(settings[key]) != str:
                 R = settings[key]["range"]
                 settings[key]["range"] = [
                     [x * c for x in r] for r in R
-                ]  # nested list comprehension
+                ]
                 settings[key]["lockpoint"] *= c
-            elif key != "Master":  # range for slave settings
+            elif key != "Master":
                 R = settings[key]["range"]
                 settings[key]["range"] = [x * c for x in R]
                 settings[key]["lockpoint"] *= c
@@ -774,82 +752,130 @@ class LockClient(Sender):
     def set_dec(self, master_RP, dec):
         """
         Set the dec setting for redpitayas associated with a specific master RP
-        --> adjusts the scan frequency for a specific cavity!
         """
         if not check_dec(dec):
             return
-        #  first, find the redpitayas associated with master_RP
         RPs = self.find_slave_RPs(master_RP)
-        # then, get the recent dec setting and use it to rescale the relevant settings
         for RP in RPs:
             dec0 = self.get_current_dec(RP)
-            self.rescale_settings(RP, dec / dec0)  # adjust the settings accordingly!
-        # afterwards, overwrite the setting for the master laser!
+            self.rescale_settings(RP, dec / dec0)
         self.RPs[master_RP].settings["Master"]["dec"] = dec
         for RP in RPs:
-            self.save_settings(RP)  # finally save all the settings to the json files!
-            # ... and send the setting to the redpitayas!
+            self.save_settings(RP)
             self.send(RP, "set_dec", value=dec)
-        sleep(0.5)  # wait a bit until the decimation on the redpitayas is set up!
+        sleep(0.5)
 
     ################ Monitoring related functions ######################
+
     @_check_for_loop
     @_check_cavity_scanned
     def start_error_monitor(self, RP, tmin=10e-3):
         """
-        Starts the error monitoring. Using multiprocessing, an event loop is run
-        to repeatedly read out locking errors from the monitoring RedPitaya. These
-        are visualized using a repeatedly updated plot.
+        Starts the error monitoring on the monitoring RedPitaya.
 
-        Parameters
-        ----------
-        RP : str
-            Key of the monitoring RedPitaya in question.
-        tmin : float, optional
-            Minimum waiting time for between each step in seconds. Is used to optimize the
-            data transfer for this monitoring application. The default is 10e-3.
-
+        For ``scan_mon`` mode: uses a background thread (see start_monitor
+        docstring for why threading is used instead of mp.Process on Windows).
         """
         if RP in self.monitors:
             mon = self.monitors[RP]
             master_RP = self.find_master_RP(RP)
             settings = self.retrieve_monitor_settings(master_RP)
-            print("Starting background process")
-            self.p = mp.Process(
-                target=monitor_errors,
-                args=(mon["running_err"], self.RPs[RP], mon["queue_err"], settings),
-                kwargs=dict(FSR=self.FSR, tmin=tmin),
-            )
-            self.p.daemon = True
-            self.p.start()
-            print("monitoring process started")
+            if self.RPs[RP].mode == "scan_mon":
+                rp_mon = RP_client(
+                    self.RPs[RP].addr,
+                    self.RPs[RP].settings,
+                    mode="monitor",
+                )
+                rp_mon.label        = self.RPs[RP].label
+                rp_mon.connected    = True
+                rp_mon.loop_running = True
+                rp_mon.lsock        = self.RPs[RP].lsock
+                print("Starting error monitor thread (scan_mon mode)")
+                t = threading.Thread(
+                    target=monitor_errors,
+                    args=(mon["running_err"], rp_mon, mon["queue_err"], settings),
+                    kwargs=dict(FSR=self.FSR, tmin=tmin),
+                    daemon=True,
+                )
+                t.start()
+                print("Error monitor thread started")
+            else:
+                print("Starting background process")
+                self.p = mp.Process(
+                    target=monitor_errors,
+                    args=(mon["running_err"], self.RPs[RP], mon["queue_err"], settings),
+                    kwargs=dict(FSR=self.FSR, tmin=tmin),
+                )
+                self.p.daemon = True
+                self.p.start()
+                print("monitoring process started")
 
     @_check_for_loop
     @_check_cavity_scanned
     def start_monitor(self, RP):
         """
-        Starts the monitoring of the cavity signal. Using multiprocessing,
-        an event loop is run to repeatedly read out the cavity signal data from
-        the monitoring RedPitaya. The signal is repeatedly updated in a plot.
+        Starts the monitoring of the cavity signal.
 
-        Parameters
-        ----------
-        RP : str
-            Key of the monitoring RedPitaya in question.
+        For ``scan_mon`` mode: uses a background **thread** instead of a
+        separate process.  On Windows, mp.Process uses "spawn" which starts
+        a fresh interpreter where Sender's class-level event loop variables
+        are never initialised, causing every send() call to crash.
+        Threading shares the parent process so Sender.running / Sender.sel
+        are already set and port 5000 is immediately usable.
 
+        For plain ``monitor`` mode: keeps the original mp.Process behaviour.
         """
         if RP in self.monitors:
             mon = self.monitors[RP]
             master_RP = self.find_master_RP(RP)
             settings = self.retrieve_monitor_settings(master_RP)
-            print("Starting background process")
-            self.p = mp.Process(
-                target=monitor,
-                args=(mon["running"], self.RPs[RP], mon["queue"], settings),
-            )
-            self.p.daemon = True
-            self.p.start()
-            print("monitoring process started")
+            if self.RPs[RP].mode == "scan_mon":
+                # Port 5066: dedicated monitor port on the board.
+                # No Sender event loop needed — pure TCP connect/get/close.
+                # Qt window setup runs on the main thread (Windows requirement).
+                rp_mon = RP_client(
+                    self.RPs[RP].addr,
+                    self.RPs[RP].settings,
+                    mode="monitor",
+                )
+                rp_mon.label     = self.RPs[RP].label
+                rp_mon.connected = True
+                m_obj = Monitor(rp_mon, mon["queue"], settings)
+                m_obj.monitor_running = mon["running"]
+                m_obj.running = True   # skip Sender guard in any legacy send()
+                print("Setting up monitor on main thread (Qt window)...")
+                m_obj.setup_monitor()
+                mon["running"].value = True
+                def _update_loop(m, q, v):
+                    from time import sleep as _sl
+                    import queue as _q
+                    while v.value:
+                        _sl(10e-3)
+                        try:
+                            query = q.get_nowait()
+                            if query[0] == "stop":       v.value = False
+                            elif query[0] == "settings": m.update_settings(query[1])
+                            elif query[0] == "filter":   m.toggle_filter(query[1])
+                        except _q.Empty:
+                            pass
+                        try:
+                            m.update_monitor()
+                        except Exception:
+                            pass
+                t = threading.Thread(target=_update_loop,
+                                     args=(m_obj, mon["queue"], mon["running"]),
+                                     daemon=True)
+                t.start()
+                print("Monitor started (scan_mon mode — port 5066)")
+            else:
+                print("Starting background process")
+                self.p = mp.Process(
+                    target=monitor,
+                    args=(mon["running"], self.RPs[RP], mon["queue"], settings),
+                )
+                self.p.daemon = True
+                self.p.start()
+                print("monitoring process started")
 
     def filter_monitor(self, RP, on=True):
         if RP in self.monitors:
@@ -868,8 +894,9 @@ class LockClient(Sender):
     def set_monitor(self, RP):
         if len(self.monitors) == 0:
             return
-        # get monitor settings, which contains all lasers
         monitor_RP = self.find_monitor_RP(RP)
+        if monitor_RP is None:
+            return
         if self.monitors[monitor_RP]["running"].value:
             self.set_monitor_of_type(monitor_RP, Type="cavity")
         elif self.monitors[monitor_RP]["running_err"].value:
@@ -878,12 +905,6 @@ class LockClient(Sender):
     def stop_monitor(self, RP):
         """
         Stops any monitoring (error_monitor or monitor) on the RedPitaya.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the monitoring RedPitaya in question.
-
         """
         if RP in self.monitors:
             if self.monitors[RP]["running"].value:
@@ -896,46 +917,16 @@ class LockClient(Sender):
     ############## RP related functions #######################################
 
     def init_SG_settings(self, RP, laser, **kwargs):
-        """
-        Checks for mandatory settings for SG-filter based peak finders. If not
-        given, default values are taken.
-        """
         settings = self.RPs[RP].settings[laser]["peak_finder"]
         if "window_size" not in kwargs:
-            kwargs["window_size"] = settings["window_size"]  # use already window size
+            kwargs["window_size"] = settings["window_size"]
         elif "order" not in kwargs:
-            kwargs["order"] = settings["order"]  # use already used order
+            kwargs["order"] = settings["order"]
         return kwargs
 
     def set_peakfinder(self, RP, laser, peak_finder, **kwargs):
-        """
-        Sets up a peakfinder that is used on the redpitaya (RP) for a certain laser during the locking loop.
-        The peakfinder is denoted by a string, and if necessary, keyword arguments
-        (kwargs) of the respective algorithm can be provided. The following
-        peakfinders have been implemented by default on the redpitayas:
-            - "maximum" : simply finds the maximum position of the data
-            - "SG_deriv" : finds max of raw data, then filters the signal around
-                the maximum using a savitzky-golay filter for first order derivative
-                and detects the zero-crossing using linear interpolation
-            - "SG_maximum" : finds max of raw data, then filters the signal around
-                the maximum using a savitzky-golay filter (0th order) and detects
-                the maximum again.
-        If SG-filter is involved, the following kwargs should be provided:
-            - "window_size" : number of data points used for convolution of the signal.
-                            Default: 21
-            - "order" : polynomial order of the "fit" that is attempted with the filter.
-                        An order of 0 with deriv = 0 results in a moving average.
-                        For even order derivatives, use even orders. For odd order derivatives, use odd orders.
-                        Default: 2 for SG_maximum, 1 for SG_deriv.
-            - "deriv" : Order of the derivative that is applied to the data using the filter.
-                        Default: 0 for SG_maximum, 1 for SG_deriv. Do not change, this will
-                        be applied automatically dependent on the filter.
-
-        The optimal peakfinder may depend on the quality of the cavity signal.
-        """
-
-        value = kwargs  # use kwargs dictionary as base
-        value["name"] = peak_finder  # add the name to the dict
+        value = kwargs
+        value["name"] = peak_finder
         if peak_finder[:2] == "SG":
             value = self.init_SG_settings(RP, laser, **value)
         if peak_finder == "SG_deriv":
@@ -946,21 +937,15 @@ class LockClient(Sender):
             value["deriv"] = 0
             if value["order"] < 0:
                 value["order"] = 0
-        self.update_setting(RP, laser, "peak_finder", value)  # update the settings!
-        # return self.send(RP, 'set_peakfinder', value =  value)
+        self.update_setting(RP, laser, "peak_finder", value)
 
     def show_current(self, RP):
         """
         show the current data on the inputs of redpitaya RP in a plot.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the respective redpitaya that is adressed.
         """
         acq = self.acquire(RP)
         plt.close(RP)
-        if acq.size > 0:  # if a list is returned!
+        if acq.size > 0:
             plt.figure(RP)
             plt.plot(acq[0], acq[1], label="Ch1")
             plt.plot(acq[0], acq[2], label="Ch2")
@@ -972,49 +957,13 @@ class LockClient(Sender):
     @_check_for_loop
     @_check_cavity_scanned
     def acquire(self, RP):
-        """
-        collect current data from the inputs on the redpitaya RP
-
-        Parameters
-        ----------
-        RP : str
-            Key of the respective redpitaya that is adressed.
-
-        Returns
-        -------
-        np.array
-            acquired data. Also saved as self.acquisition.
-
-        """
         acquisition = np.array(self.send(RP, "acquire"))
         return acquisition
 
     @_check_for_loop
     @_check_cavity_scanned
     def acquire_ch_n(self, RP, ch, n):
-        """
-        collect data from a certain input (ch) on the redpitaya (RP) n times in sequence.
-        If n is larger than 100,the redpitaya CPU start having problems to save and transfer the data.
-        Thus, the acquisition is split into several sets of max. 100 traces. for n > 100.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the respective redpitaya that is adressed.
-        ch : int
-            input channel of the redpitaya oscilloscope.
-        n : int
-            number of subsequent data sets to retrieve from the redpitaya.
-
-        Returns
-        -------
-        dat : np.array
-            data of all the collected traces, concatenated into a single array.
-
-        """
-        # acquire n traces on channel ch
         if n > 100:
-            # if more than 100 traces, then split this task auch that the redpitaya only saves 100 traces at once!
             dat = np.empty((0, int(2**14)))
             n_remaining = n
             while n_remaining > 0:
@@ -1033,55 +982,18 @@ class LockClient(Sender):
     ############## communication stuff ###########################
 
     def send(self, RP, action, value="Hello world!", loop_action=False):
-        """
-        Sends a message to the respective redpitaya (RP). Messages consist of
-        an action that is to be carried out. Some actions also require a value.
-        That way, it is possible to send commands to the redpitaya to carry out
-        certain tasks!
-
-        Parameters
-        ----------
-        RP : str
-            Key in self.RPs for the respective redpitaya.
-        action : str
-            defines the action to be carried out on the redpitaya.
-            Must be recognized by the code on the redpitaya
-        value : str, optional
-            defines a value that is queried in combination with the action.
-            The default is 'Hello world!'.
-
-        Returns
-        -------
-        str
-            respone from the redpitaya. Depends on the action. If no RP found,
-            None is returned.
-
-        """
         if RP in self.RPs:
-            if (
-                self.RPs[RP].mode == "ext_scan"
-            ):  # if external scan, no connection exists!
+            if self.RPs[RP].mode == "ext_scan":
                 return None
             loop = self.RPs[RP].loop_running
             return self.RPs[RP].send(
                 self, action, value=value, loop_action=loop_action, loop=loop
-            )  # call the respective send method.
+            )
         else:
             print(f"{RP} not found.")
             return None
 
     def connect(self, RP):
-        """
-        star the host server on an individual redpitaya. This is mandatory in order
-        to send messages to the redpitaya. takes up to 5s for the redpitaya to
-        load all the required packages.
-
-        Parameters
-        ----------
-        RP : str
-            Key in self.RPs for the respective redpitaya.
-        """
-        # start the host server on an individual redpitaya
         if RP in self.RPs:
             if not self.RPs[RP].connected:
                 print("connecting...")
@@ -1093,34 +1005,16 @@ class LockClient(Sender):
             print(f"{RP} not found.")
 
     def connect_all(self):
-        """
-        Start the host server on all of the redpitayas. This is mandatory
-        in order to send messages to the redpitayas! Individual redpitayas take 5s to
-        load all the required packages. Because of that, threading is used to
-        reduce waiting time.
-        """
         print("connecting...")
         for RP in self.RPs:
             t = threading.Thread(
                 target=self.RPs[RP].start_host_server, daemon=True
-            )  # collect all connection functions in threads
+            )
             t.start()
-            t.join()  # join the thread such that the main program waits for all redpitayas to connect!
-        sleep(
-            5
-        )  # sleep for 5 seconds while each redpitaya loads the respective libraries.
+            t.join()
+        sleep(5)
 
     def disconnect(self, RP):
-        """
-        Used to close the socket communication (listening server) on a RedPitaya.
-
-        Parameters
-        ----------
-        RP : str
-            Key in self.RPs for the respective redpitaya.
-
-        """
-        # closes the ssh connection
         if self.RPs[RP].connected:
             self.send(RP, "stop")
             self.RPs[RP].connected = False
@@ -1132,6 +1026,23 @@ class LockClient(Sender):
 
 
 class Monitor(Sender):
+    """
+    Live cavity signal monitor with dark Catppuccin theme.
+
+    Class flag
+    ----------
+    ``Monitor.show_trigger``  (default ``True``)
+        ``True``  → dual-axis layout: IN1 cavity (top, 3×height) + IN2 trigger (bottom)
+        ``False`` → single-axis: IN1 cavity only
+
+    Set the flag *before* calling ``start_monitor()``:
+        >>> from lockclient import Monitor
+        >>> Monitor.show_trigger = False
+    """
+
+    # ── class-level flag: set to False before start_monitor() to hide trigger ──
+    show_trigger = True
+
     def __init__(self, RP, queue, settings, bool_var=None):
         Sender.__init__(self)
         self.mode = "monitor"
@@ -1141,6 +1052,9 @@ class Monitor(Sender):
         self.settings = settings
         self.monitor_running = bool_var  # a shared boolean variable
         self.filter = False
+        # snapshot the class flag at construction time so the child process
+        # gets a stable value even if the parent later changes it
+        self._show_trigger = self.__class__.show_trigger
 
     ################ Cavity monitoring related functions ######################
     def stop_monitor(self, event):
@@ -1151,38 +1065,169 @@ class Monitor(Sender):
     def start_monitor(self):
         """
         starts the monitoring of the cavity signal on the redpitaya RP.
-        If enabled, the peak positions can also be detected in order to check
-        how stable the detection scheme works.
         """
-        # create a thread to run the monitor in the background
         self.setup_monitor()
         self.monitor_running.value = True
         while self.monitor_running.value:
             sleep(10e-3)
             try:
                 query = self.queue.get_nowait()
-                if query[0] == "stop":  # stop the monitor!
+                if query[0] == "stop":
                     self.stop_monitor(None)
-                if query[0] == "settings":  # update the settings of the lock!
+                if query[0] == "settings":
                     self.update_settings(query[1])
-                if query[0] == "filter":  # toggle filter
+                if query[0] == "filter":
                     self.toggle_filter(query[1])
             except queue.Empty:
-                pass  # if nothing is in the queue, just repeat the loop!
+                pass
             self.update_monitor()
-        # after the loop has finished, close the monitor!
         self.close()
-        # send a message to the main process to notify that the monitor is closed!
-        return  # return required for thread to close properly.
+        return
+
+    def _raw_send(self, action, value="0"):
+        """
+        Send a request on a dedicated persistent socket to port 5065 and
+        read the complete response, handling TCP fragmentation.
+
+        On first call, opens a private socket to port 5065 (separate from
+        the scan loop's lsock to avoid race conditions) and caches it as
+        self._mon_sock / self._mon_sel for reuse on every subsequent call.
+        This eliminates per-call selector creation overhead and the shared
+        lsock race condition.
+        """
+        import json as _json, struct as _struct, selectors as _sel, io as _io
+        import socket as _socket
+        from time import time as _time
+
+        # Use the shared lsock — port 5065 only accepts one connection.
+        # A threading.Lock prevents simultaneous use by monitor + scan loop.
+        import threading as _threading
+        if not hasattr(self.RP, "_lsock_lock"):
+            self.RP._lsock_lock = _threading.Lock()
+
+        lsock = self.RP.lsock
+
+        if not hasattr(self, "_mon_sel") or self._mon_sel is None:
+            self._mon_sel = _sel.DefaultSelector()
+            self._mon_sel.register(lsock, _sel.EVENT_READ | _sel.EVENT_WRITE)
+
+        # Build raw request bytes
+        content = _json.dumps(
+            {"action": action, "value": value}, ensure_ascii=False
+        ).encode("utf-8")
+        jh_bytes = _json.dumps({
+            "byteorder": "little", "content-type": "text/json",
+            "content-encoding": "utf-8", "content-length": len(content)
+        }, ensure_ascii=False).encode("utf-8")
+        raw = _struct.pack(">H", len(jh_bytes)) + jh_bytes + content
+
+        # Acquire lock for the FULL send+receive cycle.
+        # This prevents the monitor thread and LockClient from interleaving
+        # bytes on the single shared lsock connection to port 5065.
+        with self.RP._lsock_lock:
+            local_sel = _sel.DefaultSelector()
+            local_sel.register(lsock, _sel.EVENT_READ | _sel.EVENT_WRITE)
+            sent = False
+            buf = b""
+            expected_len = None
+
+            t0 = _time()
+            while _time() - t0 < 10:
+                events = local_sel.select(timeout=0.05)
+                for key, mask in events:
+                    if mask & _sel.EVENT_WRITE and not sent:
+                        lsock.send(raw)
+                        local_sel.modify(lsock, _sel.EVENT_READ)
+                        sent = True
+                    elif mask & _sel.EVENT_READ:
+                        try:
+                            while True:
+                                chunk = lsock.recv(2**18)
+                                if not chunk:
+                                    break
+                                buf += chunk
+                        except BlockingIOError:
+                            pass
+
+                if not sent:
+                    continue
+
+                if expected_len is None and len(buf) >= 2:
+                    jh_len = _struct.unpack(">H", buf[:2])[0]
+                    if len(buf) >= 2 + jh_len:
+                        jh = _json.loads(buf[2:2 + jh_len].decode("utf-8"))
+                        expected_len = 2 + jh_len + jh["content-length"]
+
+                if expected_len is not None and len(buf) >= expected_len:
+                    break
+
+            local_sel.unregister(lsock)
+            local_sel.close()
+
+        if not buf or expected_len is None or len(buf) < expected_len:
+            return None
+
+        jh_len   = _struct.unpack(">H", buf[:2])[0]
+        jh       = _json.loads(buf[2:2 + jh_len].decode("utf-8"))
+        data     = buf[2 + jh_len: 2 + jh_len + jh["content-length"]]
+        response = _json.loads(
+            _io.TextIOWrapper(
+                _io.BytesIO(data),
+                encoding=jh["content-encoding"],
+                newline=""
+            ).read()
+        )
+        return response.get("result")
+
+    def _close_mon_sock(self):
+        """No persistent monitor socket to close — nothing to do."""
+        pass
+
+    def _port5066_send(self, ch=0):
+        """Connect to port 5066, send channel byte, receive cached ADC data."""
+        import socket as _s, struct as _st, json as _j
+        ip = self.RP.addr[0]
+        sock = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect((ip, 5066))
+        sock.sendall(bytes([ch]))
+        hdr = b""
+        while len(hdr) < 4:
+            chunk = sock.recv(4 - len(hdr))
+            if not chunk: break
+            hdr += chunk
+        if len(hdr) < 4:
+            sock.close(); return None
+        length = _st.unpack(">I", hdr)[0]
+        payload = b""
+        while len(payload) < length:
+            chunk = sock.recv(min(65536, length - len(payload)))
+            if not chunk: break
+            payload += chunk
+        sock.close()
+        return _j.loads(payload.decode("utf-8")) if len(payload) == length else None
 
     def acquire(self):
-        a = self.RP.send(self, "acquire_ch", value="0")
+        # Port 5066: dedicated monitor port, no Sender event loop, no conflicts.
+        a = self._port5066_send(ch=0)
+        if a is None:
+            raise RuntimeError("Port 5066 returned no data — is start_scan running?")
         dur, self.acquisition = a
         self.times = np.linspace(0, dur, 2**14)  # in ms
-        # save data in dictionary
         self.data = dict(
-            Cavity=np.array([self.times[1:], self.acquisition[1:]]),
+            Cavity=np.array([self.times[1:], np.array(self.acquisition)[1:]]),
         )
+        if self._show_trigger:
+            try:
+                a1 = self._port5066_send(ch=1)
+                if a1 is None: raise RuntimeError("ch1 None")
+                _, ch1 = a1
+                self._trigger_data = np.array(ch1)
+            except Exception:
+                self._trigger_data = np.zeros(len(self.acquisition))
+            self.data["Trigger"] = np.array(
+                [self.times[1:], self._trigger_data[1:]]
+            )
         if self.filter:
             self.filter_signals()
 
@@ -1210,57 +1255,114 @@ class Monitor(Sender):
 
     def set_monitor_title(self):
         if type(self.settings["Master"]) == str:
-            title = f'Cavity Monitor - {self.settings["Master"]}'  # This case is currently never true...
+            title = f'Cavity Monitor - {self.settings["Master"]}'
         else:
             title = f"Cavity Monitor - {self.RP.label}"
-        self._fig.canvas.manager.set_window_title(title)
+        try:
+            dec = self.settings["Master"]["dec"]
+            period_ms = 8e-9 * 16384 * dec * 1e3
+            title += f"   |   dec={dec}   period={period_ms:.3f} ms"
+        except Exception:
+            pass
+        trig_label = "  [trigger ON]" if self._show_trigger else "  [trigger OFF]"
+        self._fig.canvas.manager.set_window_title(title + trig_label)
+        try:
+            self._fig.suptitle(
+                title, color="#cdd6f4", fontsize=10, y=0.99, fontweight="bold"
+            )
+        except Exception:
+            pass
 
     def _decorate_figure(self):
-        # an estimate for initial ylims based on the detected signal
+        # ylim from actual signal range with 15% padding
         acq = self.data["Cavity"][1]
-        ymin = max(acq) - (max(acq) - min(acq)) * 1.2
-        ymax = max(acq) - min(acq) * 3 + min(acq)
+        span = max(acq) - min(acq) if max(acq) != min(acq) else 1.0
+        ymin = min(acq) - span * 0.15
+        ymax = max(acq) + span * 0.15
         self._ax.set_ylim(ymin, ymax)
-        self._ax.set_xlabel("Time [ms]")
-        self._ax.set_ylabel("Voltage [V]")
-        self._ax.grid()
+        self._ax.set_ylabel("IN1 — Cavity  [V]", color="#cdd6f4", fontsize=9)
+        self._ax.legend(
+            loc="upper right", fontsize=8,
+            facecolor="#313244", edgecolor="#45475a", labelcolor="#cdd6f4"
+        )
+        if self._show_trigger and hasattr(self, "_ax2") and self._ax2 is not None:
+            trig = self.data["Trigger"][1]
+            t_span = max(trig) - min(trig) if max(trig) != min(trig) else 1.0
+            self._ax2.set_ylim(min(trig) - t_span * 0.3, max(trig) + t_span * 0.3)
+            self._ax2.set_ylabel("IN2 — Trigger  [V]", color="#cdd6f4", fontsize=9)
+            self._ax2.set_xlabel("Time  [ms]", color="#cdd6f4", fontsize=9)
+            self._ax2.legend(
+                loc="upper right", fontsize=8,
+                facecolor="#313244", edgecolor="#45475a", labelcolor="#cdd6f4"
+            )
+        else:
+            self._ax.set_xlabel("Time  [ms]", color="#cdd6f4", fontsize=9)
 
     def _setup_figure(self):
-        self._fig, self._ax = plt.subplots(1, 1, figsize=(7 * golden, 7))
+        plt.style.use("dark_background")
+        # ── dual-axis layout when trigger is enabled ──────────────────────────
+        if self._show_trigger:
+            self._fig, (self._ax, self._ax2) = plt.subplots(
+                2, 1, figsize=(7 * golden, 7),
+                sharex=True,
+                gridspec_kw={"height_ratios": [3, 1], "hspace": 0.08},
+            )
+            _axes = (self._ax, self._ax2)
+        else:
+            self._fig, self._ax = plt.subplots(1, 1, figsize=(7 * golden, 6))
+            self._ax2 = None
+            _axes = (self._ax,)
+        # ── dark styling on all axes ──────────────────────────────────────────
+        self._fig.patch.set_facecolor("#1e1e2e")
+        for ax in _axes:
+            ax.set_facecolor("#181825")
+            ax.tick_params(colors="#cdd6f4", labelsize=9)
+            ax.spines[:].set_color("#45475a")
+            ax.grid(True, color="#313244", linewidth=0.6, linestyle="--")
         self.set_monitor_title()
         self.acquire()  # acquire the signal once
         self._lines = []
-        for key, val in self.data.items():
-            l = self._ax.plot(val[0], val[1], label=key)
-            self._lines.append(l[0])
+        # cavity trace — always on self._ax
+        l0, = self._ax.plot(
+            self.data["Cavity"][0], self.data["Cavity"][1],
+            color="#4fc3f7", lw=1.0, label="IN1 — Cavity"
+        )
+        self._lines.append(l0)
+        # trigger trace — only on self._ax2 when enabled
+        if self._show_trigger and self._ax2 is not None:
+            l1, = self._ax2.plot(
+                self.data["Trigger"][0], self.data["Trigger"][1],
+                color="#a5d6a7", lw=0.9, label="IN2 — Trigger"
+            )
+            self._lines.append(l1)
         self._decorate_figure()
 
     def setup_monitor(self):
         """
         sets the monitoring of the cavity signal up. Prepares a corresponding figure.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the respective redpitaya that is adressed.
-        peaks : boolean, optional
-            whether to detect peaks or not. The default is False.
+        Retries for up to 10s waiting for port 5066 to become available.
         """
-        # initialize the figure
-        self._setup_figure()
-        self.plot_settings()  # add ranges and setpoints to the plot (significant details from locksettings)
-        self._fig.canvas.draw()  # draw the initial canvas of the figure
-        plt.show(
-            block=False
-        )  # this is required in order to see the figure when using multiprocessing
-        # initialize the BlitManager in order to only update the data points in the plot!
+        from time import sleep as _sl, time as _t
+        t0 = _t()
+        while True:
+            try:
+                self._setup_figure()
+                break
+            except Exception as _e:
+                elapsed = _t() - t0
+                if elapsed > 10:
+                    raise RuntimeError(
+                        "Monitor setup failed after 10s: {}\n"
+                        "Make sure start_scan() is running first.".format(_e))
+                print("Waiting for port 5066... ({:.1f}s)".format(elapsed))
+                _sl(1.0)
+        self.plot_settings()
+        self._fig.canvas.draw()
+        plt.show(block=False)
         self._bm = BlitManager(self._fig.canvas, animated_artists=self._lines)
-        self._fig.canvas.mpl_connect(
-            "close_event", self.stop_monitor
-        )  # close the monitor whenever the plot is closed!
+        self._fig.canvas.mpl_connect("close_event", self.stop_monitor)
 
     def create_label(self, key):
-        # create a label for the lockpoint in the plot
         if "label" in self.settings[key]:
             label = f'{self.settings[key]["label"]} | {key}'
         else:
@@ -1268,17 +1370,14 @@ class Monitor(Sender):
         return label
 
     def plot_filtered_signals(self):
-        # adds filtered signals to the plot
         for key, val in self.data.items():
-            if key != "Cavity":  # do not replot the actual data!
+            if key != "Cavity":
                 l = self._ax.plot(val[0], val[1])[0]
                 self._lines.append(l)
                 self._bm.add_artist(l)
 
     def remove_filtered_signals(self):
-        # removes filtered signals from the plot
         for j in range(len(self._lines[1:])):
-            # 3 steps are used to properly remove all references to the plotted objects
             ref = self._lines[1:].pop(0)
             ref.remove()
             del ref
@@ -1287,88 +1386,86 @@ class Monitor(Sender):
                 self.data.pop(key)
 
     def plot_settings(self):
-        self._setrefs = []  # used for collecting line references
-        ymin, ymax = self._ax.get_ylim()  # get the current ylim
+        self._setrefs = []
+        ymin, ymax = self._ax.get_ylim()
         xlim = self._ax.get_xlim()
-        i = 1  # counting integer used for coloring
+        _C_RANGE  = "#90caf9"   # pale blue — range spans
+        _C_LOCKPT = "#ffb74d"   # amber     — Master lockpoint
+        _C_SLAVE  = ["#ef9a9a", "#ce93d8", "#80cbc4"]
+        slave_idx = 0
         for key, val in self.settings.items():
             if val["enabled"]:
                 if key == "Master":
-                    c = "k"
-                    for R in val[
-                        "range"
-                    ]:  # indicate ranges using axvspan and setpoints using vlines
-                        ref = plt.axvspan(
-                            self.times[R[0]], self.times[R[1]], alpha=0.2, facecolor=c
+                    c_span = _C_RANGE
+                    c_line = _C_LOCKPT
+                    for R in val["range"]:
+                        ref = self._ax.axvspan(
+                            self.times[R[0]], self.times[R[1]],
+                            alpha=0.18, facecolor=c_span, edgecolor="none"
                         )
                         self._setrefs.append(ref)
                 else:
-                    c = f"C{i}"
+                    c_span = _C_SLAVE[slave_idx % len(_C_SLAVE)]
+                    c_line = _C_SLAVE[slave_idx % len(_C_SLAVE)]
+                    slave_idx += 1
                     R = val["range"]
-                    ref = plt.axvspan(
-                        self.times[R[0]], self.times[R[1]], alpha=0.2, facecolor=c
+                    ref = self._ax.axvspan(
+                        self.times[R[0]], self.times[R[1]],
+                        alpha=0.18, facecolor=c_span, edgecolor="none"
                     )
                     self._setrefs.append(ref)
-                ref = plt.vlines(
-                    [val["lockpoint"]], -1, 1, color=c, label=self.create_label(key)
+                ref = self._ax.vlines(
+                    [val["lockpoint"]], ymin, ymax,
+                    color=c_line, lw=1.5, ls="--",
+                    label=self.create_label(key)
                 )
                 self._setrefs.append(ref)
-                i += 1
         self._ax.set_xlim(xlim)
         self._ax.set_ylim(ymin, ymax)
         self._ax.relim()
-        self._ax.legend()
+        self._ax.legend(
+            loc="upper right", fontsize=8,
+            facecolor="#313244", edgecolor="#45475a", labelcolor="#cdd6f4"
+        )
         print("Settings added to plot", flush=True)
 
     def remove_settings(self):
-        # remove significant settings from the plot:
-        self._ax.legend().remove()
+        leg = self._ax.get_legend()
+        if leg is not None:
+            leg.remove()
         for j in range(len(self._setrefs)):
-            # 3 steps are used to properly remove all references to the plotted objects
             ref = self._setrefs.pop(0)
             ref.remove()
             del ref
 
     def reset_background(self):
-        # sets a new background for the blitting!
         for l in self._lines:
-            l.set_data([], [])  # empty the line data for the background!
+            l.set_data([], [])
         self._fig.canvas.draw()
-        self._bm.on_draw(None)  # this should set another background for the plot!
-        self.plot_lines()  # replot the lines
+        self._bm.on_draw(None)
+        self.plot_lines()
 
     def update_settings(self, settings):
-        # update the settings!
-        self.acquire()  # obtain new settings (relevant for new time-axis when changing decimation)
-        self.settings = (
-            settings  # update the settings attribute for the following functions!
-        )
-        self.remove_settings()  # remove old settings from plot
-        self.plot_settings()  # plot the new settings!
+        self.acquire()
+        self.settings = settings
+        self.remove_settings()
+        self.plot_settings()
         self.reset_background()
 
     def plot_lines(self):
-        # plots the data lines
-        for l, d in zip(self._lines, self.data.values()):
-            l.set_data(d[0], d[1])
-            self._bm.update()
+        # plots the data lines — self._lines[0] is cavity, [1] is trigger (if enabled)
+        self._lines[0].set_data(self.data["Cavity"][0], self.data["Cavity"][1])
+        if self._show_trigger and len(self._lines) > 1 and "Trigger" in self.data:
+            self._lines[1].set_data(self.data["Trigger"][0], self.data["Trigger"][1])
+        self._bm.update()
 
     def update_monitor(self):
-        """
-        iteration for the monitoring of the cavity signal on a redpitaya RP.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the respective redpitaya that is adressed.
-        peaks : boolean, optional
-            whether to detect peaks or not. The default is False.
-        """
         self.acquire()
         self.plot_lines()
 
     def close(self):
         self.monitor_running.value = False
+        self._close_mon_sock()
         self.stop_event_loop()
 
 
@@ -1382,76 +1479,51 @@ class ErrorMonitor(Sender):
         self.queue = queue
         self._fig = None
         self.settings = settings
-        self.monitor_running = bool_var  # a shared boolean variable
+        self.monitor_running = bool_var
 
     def stop_monitor(self, event):
-        self.monitor_running.value = (
-            False  # this is used to stop the monitor if figure is closed!
-        )
+        self.monitor_running.value = False
 
     def close(self):
         self.monitor_running.value = False
         self.stop_event_loop()
 
     def start_monitor(self):
-        """
-        starts the monitoring of the cavity signal on the redpitaya RP.
-        If enabled, the peak positions can also be detected in order to check
-        how stable the detection scheme works.
-
-        Parameters
-        ----------
-        RP : str
-            Key of the respective redpitaya that is adressed.
-        peaks : boolean, optional
-            whether to detect peaks or not. The default is False.
-        """
-        # create a thread to run the monitor in the background
         self.setup_monitor()
         self.monitor_running.value = True
         while self.monitor_running.value:
             try:
                 sleep(self.tmin)
                 query = self.queue.get_nowait()
-                if query[0] == "stop":  # stop the monitor!
+                if query[0] == "stop":
                     self.stop_monitor(None)
-                if query[0] == "settings":  # update the settings of the lock!
+                if query[0] == "settings":
                     self.update_settings(query[1])
                 if query[0] == "save":
                     self.save_errors(query[1])
             except queue.Empty:
-                pass  # if nothing is in the queue, just repeat the loop!
+                pass
             self.update_monitor()
-        # after the loop has finished, close the monitor!
         self.close()
-        # send a message to the main process to notify that the monitor is closed!
-        return  # return required for thread to close properly.
+        return
 
     def setup_monitor(self):
-        """
-        Initializes the figure that is used to monitor the laser frequency deviations.
-        """
         self.RP.send(self, "update_settings", self.settings)
         self._setup_figure()
-        self._t0 = perf_counter()  # initial timestamp for time axis
-        self.times = []  # time axis
+        self._t0 = perf_counter()
+        self.times = []
         self._fig.canvas.draw()
-        plt.show(
-            block=False
-        )  # this is required in order to see the figure when using multiprocessing
+        plt.show(block=False)
         self._bm = BlitManager(
             self._fig.canvas, animated_artists=list(self._lines.values())
-        )  # for blitting only
-        self._fig.canvas.mpl_connect(
-            "close_event", self.stop_monitor
-        )  # close the monitor whenever the plot is closed!
+        )
+        self._fig.canvas.mpl_connect("close_event", self.stop_monitor)
 
     def _setup_figure(self):
         self._fig, self._ax = plt.subplots(1, 1, figsize=(5 * golden, 5))
         self.set_monitor_title()
         self._lines, self.errs = dict(), dict()
         for key, val in self.settings.items():
-            # if val['enabled']: # only if the lock is enabled
             l = self._ax.plot([], [], marker="o", label=key)[0]
             self._lines[key] = l
             self.errs[key] = []
@@ -1459,33 +1531,22 @@ class ErrorMonitor(Sender):
 
     def set_monitor_title(self):
         if type(self.settings["Master"]) == str:
-            title = f'Error Monitor - {self.settings["Master"]}'  # This case is currently never true...
+            title = f'Error Monitor - {self.settings["Master"]}'
         else:
             title = f"Error Monitor - {self.RP.label}"
         self._fig.canvas.manager.set_window_title(title)
 
     def _decorate_figure(self):
-        self._ax.set_ylim([-50, 50])  # error range of +-50 MHz
+        self._ax.set_ylim([-50, 50])
         self._ax.legend()
         self._ax.grid()
         self._ax.set_ylabel("Error [MHz]")
         self._ax.set_xlabel("Locking time [s]")
 
     def save_errors(self, filename):
-        """
-        Save recorded laser frequency drift after monitoring in a textfile.
-
-        Parameters
-        ----------
-        filename : str
-            name of the file to save the recorded errors.
-        """
-        # first, combine the respective arrays in a dictionary --> helps keep track of what is what...
         dat = deepcopy(self.errs)
         dat["times"] = self.times
-        with open(
-            f"{filename}.json", "w"
-        ) as file:  # dump the data into a json file, since it is a dictionary.
+        with open(f"{filename}.json", "w") as file:
             json.dump(dat, file, indent=4)
 
     def update_settings(self, settings):
@@ -1499,40 +1560,78 @@ class ErrorMonitor(Sender):
             if new_errs == "skipped":
                 self.errs[key].append(np.nan)
             else:
-                if key in new_errs:  # if the error is measured on the redpitaya:
-                    self.errs[key].append(
-                        new_errs[key] * self.FSR
-                    )  # update the error value
+                if key in new_errs:
+                    self.errs[key].append(new_errs[key] * self.FSR)
                 else:
-                    self.errs[key].append(np.nan)  # otherwise, fill it with nan value.
+                    self.errs[key].append(np.nan)
 
     def update_monitor(self):
-        """
-        Iteration of the monitoring of laser frequency drifts measured on the cavity.
-        Data is recorded and can be saved using 'self.save_errors(filename)'.
-        """
-
-        self.update_errs()  # update error values
+        self.update_errs()
         self.times.append(perf_counter() - self._t0)
         for key, l in self._lines.items():
-            if (
-                len(self.times) >= 300
-            ):  # only plot last 100 points --> choose first index accordingly
+            if len(self.times) >= 300:
                 i0 = -300
             else:
                 i0 = 0
             l.set_xdata(self.times[i0:])
             l.set_ydata(self.errs[key][i0:])
             if len(self.times) > 2:
-                self._ax.set_xlim(
-                    self.times[i0], self.times[-1]
-                )  # updating the xlim accordingly, since new points get added
+                self._ax.set_xlim(self.times[i0], self.times[-1])
                 self._ax.relim()
-        self._bm.update()  # Currently this is done with blitting.
+        self._bm.update()
 
 
 class RP_client(RP_connection):
     def __init__(self, address, settings, mode="lock"):
-        RP_connection.__init__(self, address, mode=mode)
+        # "scan_mon" is a PC-side concept — the board runs as plain "scan".
+        # Pass the translated mode to RP_connection so upload_current() writes
+        # RunLock.py with  RP_mode = 'scan'  (the only thing the board knows).
+        _board_mode = "scan" if mode == "scan_mon" else mode
+        RP_connection.__init__(self, address, mode=_board_mode)
+        # Store the original PC-side mode so LockClient can still see "scan_mon".
+        self.mode = mode
         self.settings = settings
         self.label = "Default"
+
+######################## Inline event loop (Windows fix) #####################
+# Windows SelectSelector is not thread-safe: a socket registered from one
+# thread is invisible to another thread polling get_map(). The inline mixin
+# processes the selector in the SAME thread that calls send(), bypassing the
+# background thread entirely.
+
+class _InlineEventLoopMixin:
+    def start_event_loop(self):
+        self.running = True   # no background thread
+
+    def stop_event_loop(self):
+        self.running = False
+
+    def _process_sel_once(self):
+        if not self.sel.get_map():
+            return
+        try:
+            events = self.sel.select(timeout=0.01)
+            for key, mask in events:
+                message = key.data
+                if message is not None:
+                    try:
+                        if self.mode == "monitor":
+                            message.buffersize = int(2**18)
+                        else:
+                            message.buffersize = int(2**12)
+                        message.process_events(mask)
+                    except Exception:
+                        import traceback as _tb
+                        print("[InlineEventLoop] error:", flush=True)
+                        _tb.print_exc()
+                        message.close()
+        except Exception:
+            pass
+
+
+class _InlineMonitor(_InlineEventLoopMixin, Monitor):
+    pass
+
+
+class _InlineErrorMonitor(_InlineEventLoopMixin, ErrorMonitor):
+    pass

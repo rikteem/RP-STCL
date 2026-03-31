@@ -12,6 +12,7 @@ the STCL remotely using individual RedPitayas.
 
 """
 # modules used for socket communication
+from email import message
 import socket
 import selectors
 import traceback
@@ -369,7 +370,13 @@ class RP_connection:
                     break  # break whenever message closes connection --> also when exception occurs during event_loop!
 
             # retrieve the response!
-            result = message.response["result"]
+            # result = message.response["result"]
+            if message.response is None:
+                print(f"[DEBUG] No response received from {message.addr} for action. "
+                      f"Server may have closed connection early.")
+                result = None
+            else:
+                result = message.response["result"]
             if loop_action:
                 self.lsock = None
         else:  # if no event_loop is running, return None
