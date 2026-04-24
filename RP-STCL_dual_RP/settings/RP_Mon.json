@@ -1,0 +1,53 @@
+{
+    "Master": "RP_Scan",
+    "Slave1": {
+        "label": "Repumper1",
+        "PID": {
+            "P": 0.0,
+            "I": 0.5,
+            "D": 0,
+            "I_val": 0,
+            "limit": [
+                -0.99,
+                0.99
+            ]
+        },
+        "range": [
+            1.7,
+            2.2
+        ],
+        "sign": -1,
+        "lockpoint": 1.92,
+        "enabled": true,
+        "peak_finder": {
+            "name": "SG_deriv",
+            "window_size": 21,
+            "order": 1
+        }
+    },
+    "Slave2": {
+        "label": "Repumper2",
+        "PID": {
+            "P": 0.0,
+            "I": 0.5,
+            "D": 0,
+            "I_val": 0,
+            "limit": [
+                -0.99,
+                0.99
+            ]
+        },
+        "range": [
+            1.0,
+            1.7
+        ],
+        "sign": -1,
+        "lockpoint": 1.2,
+        "enabled": false,
+        "peak_finder": {
+            "name": "SG_deriv",
+            "window_size": 21,
+            "order": 1
+        }
+    }
+}

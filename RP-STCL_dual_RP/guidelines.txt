@@ -1,0 +1,150 @@
+Git Commands:
+    # 1. Create and switch to new branch (changes carry over automatically)
+    git checkout -b new-branch-name
+
+    # 2. Now stage and commit
+    git add .
+    git commit -m "your message"
+
+    # 3. Push
+    git push -u origin new-branch-name
+
+    # 4. Check repo origin
+    git remote -v
+
+    # 5. Fetch all new branches and commits
+    git fetch origin
+
+    # 6. Up-to-date local branch
+    git pull origin main-stcl
+
+    # 7. Check all branches
+    git branch -a | findstr origin
+
+    # 8. Pull latest files from GitHUb
+    git status (come to the brnach you want to sync)
+    git pull origin <branch name>
+
+
+
+Commands:
+1. systemctl restart redpitaya_nginx
+2. ss -tlnp | grep -E "5000|5065"
+3. pkill -f RunLock.py
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+Switch between Projects:
+
+//Switch to STCL project:
+
+systemctl stop rp_server
+systemctl disable rp_server
+PYTHONPATH=/opt/redpitaya/lib/python/:$PYTHONPATH python3 /root/RunLock.py
+
+//Switch to Oscilloscope project:
+
+# first kill RunLock if it's running
+pkill -f RunLock.py
+systemctl enable rp_server
+systemctl start rp_server
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+..........................................................................................................................................
+Issue 1: If ssh to board shows connection error with Port 22. And apt -a shows some other unknown ip addr blocking your board's ip
+
+Note: You might not be able to connect multiple laptops at same time as it works
+with some fingerprint which is laptop specific at a time. You may reset it as many times.
+
+then do this:
+    0. Connect to Putty COMX,115200,Serial. Once you are in the board follow next steps
+then do this:   
+    1. check the interface ip addr
+    you should see 
+    "root@rp-f0c97c:~#"
+    "ip addr show eth0"
+    "nano /etc/network/interfaces"
+    "
+    auto lo
+    iface lo inet loopback
+
+    auto eth0
+    iface eth0 inet static
+        address 192.168.0.<your_ip>
+        netmask 255.255.255.0
+        gateway 192.168.0.1
+    "
+    "Ctrl+O->Enter->Ctrl+X"
+    "reboot"
+    2. fix the wired-network ip addr.
+    "cat /etc/systemd/network/wired.network"
+    "nano /etc/systemd/network/wired.network"
+    "[Match]
+    Name=eth0
+
+    [Network]
+    Address=192.168.0.201/24
+    Gateway=192.168.0.1
+    DNS=8.8.8.8
+    DNS=1.1.1.1
+    # LinkLocalAddressing=ipv4
+    # DHCP=ipv4
+    IPForward=yes
+    IPMasquerade=yes
+
+    [DHCP]
+    RouteMetric=10"
+    "systemctl restart systemd-networkd"
+    "reboot"
+
+    If you are getting this error 
+    '''
+    Host key for 192.168.0.99 has changed and you have requested strict checking.
+    Host key verification failed.
+
+    '''
+    then do this
+    "ssh-keygen -R 192.168.0.<your_ip>"
+
+    Now you can ssh to your board again, it will ask for fingerprint reset. Allow that.
+
+    3. If done through serial port and arp -a still not updated then:
+    a. Check if you have put an addr out of 0-255 range
+    b. Check if your laptop's IP in 192.168.0.x not anything else by CMD->ipconfig
+
+.........................................................................................................................................
+    Issue 2: If Scan signal at oscilloscope dies all of a sudden/stop_loop hangs
+
+    go to cmd
+    1. ssh to rp-board
+    2. ss -tlnp | grep -E "5000|5065"
+    3. pkill -f RunLock.py
+    4. sleep 2
+
+    then restart kernel and re-run cells.
+
+........................................................................................................................................
+    Issue 3: If you want to check what's happening on the port do this:
+
+    1. ssh to board
+    2. "PYTHONPATH=/opt/redpitaya/lib/python/:$PYTHONPATH python3 /root/RunLock.py"
+    the logs will appear.
+
+..........................................................................................................................................
+    Issue 4: If Calibration Page doesn't open then (The EEPROM calibration data on this board is corrupt/empty for the new OS format. OS 2.07-48 uses a new universal calibration format that your board's EEPROM doesn't have — so rp_Init() gets zero gains, hits divide-by-zero, and kills the nginx worker instantly.):
+    1. Update OS from browser in Settings.
+    2. Use this prompt in Claude to run diagnostics and find failure:
+    "I have this serious problem with a RP board, which is STEMlab 125-14 V1.1. I recently flashed it with OS 2.07-48 stable. Then I opened the web browser for calibration, but the calibration page doesn't open. Also the Oscilloscope page doesn't open. I wish to debug this issue and fix it such that I can calibrate. the board. Let me know what all things you will need from me to run diagnostics and debug"
+    3. Fix Calibration File
+    # Stop nginx first
+    systemctl stop redpitaya_nginx.service
+
+    # Write factory default calibration values
+    /opt/redpitaya/bin/calib -d
+    echo "calib -d exit: $?"
+
+    # Verify calibration is now valid
+    /opt/redpitaya/bin/calib -r 2>&1 | head -5
+    

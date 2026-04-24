@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+.env
+*.log
+.DS_Store
+Thumbs.db
+.claude/

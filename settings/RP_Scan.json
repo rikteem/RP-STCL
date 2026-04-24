@@ -1,0 +1,32 @@
+{
+    "Master": {
+        "PID": {
+            "P": 0.0,
+            "I": 2.0,
+            "D": 0.0,
+            "I_val": 0,
+            "limit": [
+                -0.99,
+                0.99
+            ]
+        },
+        "range": [
+            [
+                0.01,
+                0.2
+            ],
+            [
+                0.29,
+                0.49
+            ]
+        ],
+        "lockpoint": 0.357,
+        "enabled": true,
+        "dec": 16,
+        "peak_finder": {
+            "name": "SG_deriv",
+            "window_size": 21,
+            "order": 1
+        }
+    }
+}

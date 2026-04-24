@@ -1,0 +1,137 @@
+
+
+@_check_cavity_scanned
+def start_lock(self, RP):
+    """
+    Initiate the lock with the current settings on one redpitaya.
+    """
+    self.update_settings(RP)
+    return self.start_loop(RP, "start_lock")
+```
+
+It's short, but there's a lot happening under the hood across three layers.
+
+---
+
+### Layer 1 — The guard: `@_check_cavity_scanned`
+
+Before doing anything, this decorator calls `check_cavity_scanned(RP)`. It asks: *is the cavity currently being scanned (i.e., is the ramp running)?*
+
+- If the RedPitaya is a **slave** (lock-mode RP), it checks that the **master** RP has its scan loop running. Without the cavity ramp, there's no signal to lock to, and any response from the board would never arrive — blocking the whole script.
+- If the RP is the **master** itself (or `scan_mon`), it's already scanning, so the check passes automatically.
+- If the cavity isn't scanned, `start_lock` returns an empty array and does nothing.
+
+---
+
+### Layer 2 — Settings push: `update_settings(RP)`
+
+Before starting the lock, it syncs the latest settings from the local JSON file to the RedPitaya board. The settings dictionary (per laser/cavity) contains:
+
+| Parameter | What it controls |
+|---|---|
+| **`range`** | The time window (in ms, converted to array indices) within the ramp where the peak/transmission should be found |
+| **`lockpoint`** | The position on the ramp (in ms) where the laser should be locked — i.e., the target set point |
+| **`PID`** | PID gains (P, I, D) for the feedback loop |
+| **`peak_finder`** | Algorithm used to locate the cavity resonance (e.g. Savitzky-Golay derivative `SG_deriv`, or `SG_maximum`) |
+| **`enabled`** | Bool — whether this laser channel is active |
+| **`dec`** | Decimation factor, which sets the scan frequency / time resolution |
+
+The `retrieve_settings` method is called inside, which converts all `range` and `lockpoint` values from **milliseconds → sample indices** before sending them to the board, since the firmware works in raw index space.
+
+The `@_apply_to_monitor` decorator on `update_settings` also pushes the new settings to the cavity monitor display, so the live plot updates its overlays (colored range spans, dashed lockpoint line).
+
+---
+
+### Layer 3 — Starting the lock loop: `start_loop(RP, "start_lock")`
+
+This is what actually tells the RedPitaya to start locking. It:
+
+1. Is guarded by `@_check_for_loop` — if a loop (scan or lock) is already running on that RP, it refuses and prints a warning.
+2. Spawns a **daemon thread** that calls `self.send(RP, "start_lock")` with `loop_action=True`.
+3. The `loop_action=True` flag means it opens a persistent loop socket (port 5065) and keeps the connection alive — this is the long-running lock loop on the board, not a one-shot command.
+
+---
+
+### How locking to the ramp actually works (the full picture)
+```
+Cavity ramp (Out2 triangle wave)
+        ──────╱╲──────╱╲──────╱╲──
+                 ↑ each sweep, the board acquires IN1 (cavity transmission)
+
+   Acquired signal:
+        ____     ___
+       /    \   /
+   ───/      ───
+
+   range window: [────────]   ← only this slice is searched
+   lockpoint:         |       ← target position on ramp
+
+   Peak finder locates resonance in range → computes error = peak_position − lockpoint
+   PID integrates the error → correction voltage sent to laser (Out1)
+   Loop repeats every scan period
+
+
+
+
+
+   \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+   def check_lockpoint(laser, R, val):
+      # lockpoint must be within range bounds
+```
+  and `new_range_new_lp()` will prompt you to update the lockpoint if you change the range and the old lockpoint falls outside it.
+
+### What makes a good lockpoint?
+
+A few physical constraints guide this:
+
+**It should be on the linear slope of the error signal, not at the peak tip.** If you use a derivative-based peak finder (`SG_deriv`), the "peak" it returns is actually the zero-crossing of the derivative — the inflection point of the transmission signal — which is naturally on the slope. That's the most sensitive and linear point for feedback. If you use `SG_maximum`, it returns the actual transmission maximum, which is fine for identifying position but has zero slope at the top, making it a less ideal error signal point.
+
+**It should be reproducible ramp-to-ramp.** You want the peak to appear at the same place in the ramp every sweep when unlocked. If the cavity is drifting badly, the peak wanders and locking becomes unreliable. So you pick a lockpoint in a region where the peak is stable during a free scan.
+
+**It should avoid the turnaround regions of the triangle wave.** Near the edges of the ramp (where it reverses direction), the sweep velocity is nonlinear and the cavity response can be distorted. A lockpoint near the center of the ramp half-period is safer.
+
+**For the master cavity specifically**, the range is a list of lists (e.g. `[[1.0, 4.0], [6.0, 9.0]]`) because the triangle wave has two half-sweeps (up and down), and the resonance appears twice per full period. The lockpoint is set relative to one of those, and the second range serves as a reference or is ignored depending on implementation.
+
+### Why this makes sense
+
+The lockpoint is essentially the **set point of a position controller**. Think of it like a thermostat temperature: you're not controlling temperature directly, you're controlling laser frequency, but the observable you're measuring is *where the resonance appears on the ramp*. The error signal is `(observed peak position) − (lockpoint)`, and the PID drives that error to zero. If you set the lockpoint to 4.2 ms and the peak is currently appearing at 4.5 ms, the PID pushes the laser frequency until the peak drifts back to 4.2 ms. The lockpoint anchors the entire feedback loop.
+
+---
+
+## 2. What logic connects the ramp signal to cavity peaks physically?
+
+This is the deeper question, and the answer has two parts: **physical** and **algorithmic**.
+
+### Physical connection
+
+The ramp (Out2) is a voltage that is fed to a **piezo actuator** (or an AOM/EOM driver) that controls either the cavity length or the laser frequency. As the voltage sweeps linearly, the optical path length — and therefore the resonance condition — sweeps through a range. The cavity comes into resonance (transmits light) whenever:
+```
+cavity length = n × (λ/2)   for integer n
+```
+
+This happens once per half Free Spectral Range swept. The photodetector on IN1 sees a Lorentzian peak each time this condition is met. So the ramp voltage **is** the x-axis of the cavity scan — the peak's position on that x-axis directly encodes the laser-to-cavity detuning at that moment in time.
+
+The key insight: **time along the ramp = voltage = cavity detuning.** The peak position in time is a proxy for the laser frequency offset from resonance.
+
+### Algorithmic connection in the code
+
+The lock loop on the board does this every ramp cycle:
+
+1. **Acquire** — sample IN1 over one ramp sweep. This gives you a time-series array.
+2. **Slice** — extract only the samples within the `range` window (converted from ms to indices by `ms2index()` in `retrieve_settings`). This isolates one resonance peak.
+3. **Find the peak** — run the peak finder (`SG_deriv` or `SG_maximum`) on that slice. The Savitzky-Golay derivative finds the zero-crossing of the smoothed first derivative, giving the peak center position as a sample index.
+4. **Compute the error** — `error = peak_index − lockpoint_index`. This is a dimensionless number: positive means the peak has drifted to the right (later in the sweep), negative means it drifted left.
+5. **PID** — feed the error into the PID controller. The integrator accumulates, and the output voltage is sent to Out1, which corrects the laser frequency.
+6. **Repeat** — next ramp cycle, the peak should be closer to the lockpoint.
+
+### Why the peak position encodes laser frequency
+
+When the laser drifts slightly (say, it gets warmer and its frequency increases), the cavity resonance condition is met *earlier* in the ramp sweep — because less ramp voltage is needed to bridge the gap. So the peak appears at a **smaller time index** — it shifts left on the ramp. The error becomes negative, the PID output pushes the laser frequency back down, and the peak drifts right again toward the lockpoint. This is a self-correcting negative feedback loop.
+```
+Laser drifts higher in frequency
+    → resonance met earlier in ramp
+        → peak index < lockpoint index
+            → error < 0
+                → PID pushes laser frequency down
+                    → peak drifts back to lockpoint ✓
